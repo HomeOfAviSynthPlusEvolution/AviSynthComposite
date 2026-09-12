@@ -76,7 +76,7 @@ void run(const cp_kernels* k, int bits, int width, int step, bool negative) {
   const T max = T(bits == 32 ? 1 : (1u << bits) - 1);
   for (int y = 0; y < 2; ++y)
     for (int x = 0; x < width; ++x) {
-      const size_t offset = y * stride + x * step * sizeof(T);
+      const size_t offset = y * stride + size_t(x) * step * sizeof(T);
       const T v = T((x % 3) * max / 2), alpha = T(x % 2 ? max : 0);
       std::memcpy(a.data + offset, &v, sizeof(T));
       std::memcpy(b.data + offset, &max, sizeof(T));
@@ -115,7 +115,7 @@ void run(const cp_kernels* k, int bits, int width, int step, bool negative) {
     for (int y = 0; y < 2; ++y)
       for (int x = 0; x < width - 1; ++x)
         for (size_t gap = sizeof(T); gap < size_t(step) * sizeof(T); ++gap)
-          CHECK(p[y * stride + x * step * sizeof(T) + gap] == 0xCD);
+          CHECK(p[y * stride + size_t(x) * step * sizeof(T) + gap] == 0xCD);
 }
 template <class T>
 void packed_key(const cp_kernels* k, int bits, int width, bool negative, bool bgra) {

@@ -52,10 +52,10 @@ struct Frame {
       p[i].resize(size_t(width) * height * step);
   }
   cp_const_plane read(int c) const {
-    return {packed ? p[0].data() + c : p[c].data(), ptrdiff_t(width * step * sizeof(T)), ptrdiff_t(step * sizeof(T))};
+    return {packed ? p[0].data() + c : p[c].data(), ptrdiff_t(size_t(width) * step * sizeof(T)), ptrdiff_t(step * sizeof(T))};
   }
   cp_plane write(int c) {
-    return {packed ? p[0].data() + c : p[c].data(), ptrdiff_t(width * step * sizeof(T)), ptrdiff_t(step * sizeof(T))};
+    return {packed ? p[0].data() + c : p[c].data(), ptrdiff_t(size_t(width) * step * sizeof(T)), ptrdiff_t(step * sizeof(T))};
   }
   void randomize(std::mt19937& rng, int bits) {
     for (auto& v : p)
