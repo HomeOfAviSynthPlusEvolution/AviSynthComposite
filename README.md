@@ -85,7 +85,7 @@ may similarly quantize their combined effective weight to Q16 within 1 LSB.
 Exact zero-weight and
 full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for interior opacity, as
 described below. These allowances do not extend to other operations (except additional integer operations documented below), code weights,
-or F32 plane operations. F32 YUV Multiply has a separate allowance below. Repeated
+or F32 except for the separately documented allowances below. Repeated
 operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
 for reference arithmetic; increasing working bit depth before processing reduces
 the normalized size of a code-value error.
@@ -270,3 +270,5 @@ relative error, plus subnormal rounding). Zero mask preserves input bits.
 Out-of-range guide values, nonfinite colors and other configurations retain
 reference arithmetic. This does not restrict valid F32 color excursions.
 Use `cp_process_yuv` / `CP_TARGET_C` for reference arithmetic.
+
+F32 masked MIX on continuous planes may use binary32 arithmetic for 0 < opacity <= .75 and inputs in [-1,1], with absolute error <= 8*FLT_EPSILON. Zero mask copies exactly; other inputs retain reference arithmetic. This applies to both weight rules; integer CODE behavior is unchanged.

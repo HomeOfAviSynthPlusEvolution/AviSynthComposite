@@ -237,7 +237,7 @@ void run(int bits, int step) {
       };
       for (auto target : targets)
         measure(std::to_string(target), [&] { invoke(cp_get_kernels(target), output); },
-                bits == 32 && workload == "overlay_mul" ? 2e-7 : bits != 32 && (workload == "mix" || workload == "continuous_invert" || workload == "overlay_mul" || workload == "continuous_product" || workload == "continuous_add" || workload == "continuous_subtract" || workload == "continuous_difference" || workload == "guided") ? 1 : 0);
+                bits == 32 && (workload == "overlay_mul" || workload == "mix" || workload == "code_mix" || workload == "layer_add_rgb") ? 2e-7 : bits != 32 && (workload == "mix" || workload == "continuous_invert" || workload == "overlay_mul" || workload == "continuous_product" || workload == "continuous_add" || workload == "continuous_subtract" || workload == "continuous_difference" || workload == "guided") ? 1 : 0);
 #ifdef CP_BENCH_AVX2
       if (workload == "overlay_mul" && bits != 32 && step == 1 && (cp_supported_targets() & 512))
         measure(

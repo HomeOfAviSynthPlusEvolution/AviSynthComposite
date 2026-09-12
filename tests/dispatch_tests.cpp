@@ -149,6 +149,16 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
                   expected[i] = actual[i]; // Remaining bytes still require exact canary equality.
                 }
             }
+            if (bits == 32 && op == CP_MIX && masked && step == 1 && opacity > 0 && opacity <= .75) {
+              for (int y = rows.first; y < rows.first + rows.count; ++y)
+                for (int x = 0; x < width; ++x) {
+                  const int i = origin + (negative ? -stride : stride) * y + x;
+                  if (m[i] != 0 && std::abs(double(a[i])) <= 1 && std::abs(double(b[i])) <= 1) {
+                    CHECK(std::abs(double(actual[i]) - double(expected[i])) <= 8 * std::numeric_limits<float>::epsilon());
+                    expected[i] = actual[i];
+                  }
+                }
+            }
             if (std::memcmp(actual.data(), expected.data(), size * sizeof(T)) != 0) {
               for (size_t i = 0; i < size; ++i)
                 if (std::memcmp(&actual[i], &expected[i], sizeof(T)) != 0)
@@ -203,6 +213,11 @@ static void FloatBlendSpecials(const cp_kernels* table) {
             // Non-endpoint arithmetic may choose a different quiet NaN payload.
             if ((!masked || m[i] * opacity != 0) && opacity != 0 && std::isnan(actual[i]) && std::isnan(expected[i]))
               continue;
+            if (op == CP_MIX && masked && opacity > 0 && opacity <= .75 && m[i] != 0 &&
+                std::abs(a[i]) <= 1 && std::abs(b[i]) <= 1) {
+              CHECK(std::abs(double(actual[i]) - expected[i]) <= 8 * std::numeric_limits<float>::epsilon());
+              continue;
+            }
             CHECK(std::memcmp(actual + i, expected + i, 4) == 0);
           }
         }
@@ -425,6 +440,64 @@ static void GuidedBounded(const cp_kernels* k, int bits) {
       }
 }
 
+static void BoundedFloatBlends(const cp_kernels* k) {
+  constexpr int width = 2051, pitch = width + 5, size = pitch * 2;
+  std::mt19937 rng(89271);
+  double max_normal_error = 0;
+  for (int operation : {CP_MIX, CP_PRODUCT})
+    for (bool negative : {false, true})
+      for (double opacity : {0., .003, .17, .5, .625, .75, std::nextafter(.75, 1.), 1.})
+        for (int scenario = 0; scenario < 4; ++scenario) {
+          std::vector<float> a(size), b(size), m(size), got(size), ref(size);
+          const std::vector<float> untouched(size, 19.f);
+          for (int i = 0; i < size; ++i) {
+            a[i] = float(int(rng() % 131073) - 65536) / 65536.f;
+            b[i] = float(rng() % 65536) / 65535.f;
+            m[i] = i % 7 == 0 ? 0.f : i % 7 == 1 ? 1.f : float(rng() % 65536) / 65535.f;
+            if (scenario == 1) b[i] = -a[i]; // cancellation
+            if (scenario == 2) a[i] = std::ldexp(a[i], i % 254 - 126);
+            if (scenario == 3) {
+              a[i] = i % 3 == 0 ? -0.f : i % 3 == 1 ? std::numeric_limits<float>::max() : -4.f;
+              b[i] = i % 4 == 0 ? -2.f : i % 4 == 1 ? 4.f : b[i];
+            }
+          }
+          const int origin = negative ? pitch : 0;
+          const ptrdiff_t stride = (negative ? -pitch : pitch) * sizeof(float);
+          for (int alias = 0; alias < 4; ++alias) {
+            const auto& initial = alias == 1 ? a : alias == 2 ? b : alias == 3 ? m : untouched;
+            std::copy(initial.begin(), initial.end(), got.begin());
+            std::copy(initial.begin(), initial.end(), ref.begin());
+            const auto in = [&](const std::vector<float>& v) { return cp_const_plane{v.data() + origin, stride, 4}; };
+            const auto ga = in(alias == 1 ? got : a), ra = in(alias == 1 ? ref : a);
+            const auto gb = in(alias == 2 ? got : b), rb = in(alias == 2 ? ref : b);
+            const auto gm = in(alias == 3 ? got : m), rm = in(alias == 3 ? ref : m);
+            for (int rule : {CP_WEIGHT_CONTINUOUS, CP_WEIGHT_CODE}) {
+              std::copy(initial.begin(), initial.end(), got.begin());
+              std::copy(initial.begin(), initial.end(), ref.begin());
+              const cp_plane_config c{{CP_F32,32}, operation, opacity, 0, 0, 0, 0, 0, rule};
+              CHECK(k->process_plane(&c, ga, gb, &gm, nullptr, nullptr, {got.data()+origin,stride,4}, {width,2,0,2}) == CP_OK);
+              CHECK(cp_process_plane(&c, ra, rb, &rm, nullptr, nullptr, {ref.data()+origin,stride,4}, {width,2,0,2}) == CP_OK);
+              for (int i = 0; i < size; ++i) {
+                const bool pixel = i % pitch < width;
+                const bool eligible = pixel && opacity > 0 && opacity <= .75 && m[i] != 0 &&
+                    (operation == CP_MIX ? std::abs(a[i]) <= 1 && std::abs(b[i]) <= 1
+                     : std::isfinite(a[i]) && b[i] >= 0 && b[i] <= 1);
+                if (eligible) {
+                  const double error = std::abs(double(got[i]) - ref[i]);
+                  const double limit = 8 * std::numeric_limits<float>::epsilon() *
+                      (operation == CP_MIX ? 1.0 : std::abs(double(ref[i]))) +
+                      2 * double(std::numeric_limits<float>::denorm_min());
+                  CHECK(error <= limit);
+                  if (scenario == 0) max_normal_error = std::max(max_normal_error, error);
+                } else if (!(std::isnan(got[i]) && std::isnan(ref[i])))
+                  CHECK(std::memcmp(&got[i], &ref[i], sizeof(float)) == 0);
+              }
+            }
+          }
+        }
+  std::printf("bounded float blends normalized max error %.9g\n", max_normal_error);
+}
+
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -481,6 +554,7 @@ int main() {
     ContinuousIntegerRounding<uint8_t>(table, 8);
     for (int bits = 9; bits <= 16; ++bits)
       ContinuousIntegerRounding<uint16_t>(table, bits);
+    BoundedFloatBlends(table);
     FloatEndpoints(table);
     FloatBlendSpecials(table);
   }

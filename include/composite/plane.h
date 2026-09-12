@@ -57,7 +57,8 @@ typedef struct cp_plane_config {
 // within 1 LSB, preserving product floor before blending.
 // Mask zero and exact full-weight endpoints remain exact.
 // Integer input samples and masks must fit the declared depth (see types.h).
-// This tolerance does not apply to CODE, other operations, or F32.
+// F32 masked MIX on continuous planes may use binary32 arithmetic for 0 < opacity <= .75 and inputs in [-1,1], with absolute error <= 8*FLT_EPSILON. Zero mask copies exactly; other inputs retain reference arithmetic. This applies to both weight rules; integer CODE behavior is unchanged.
+// The integer 1 LSB tolerance does not apply to integer CODE or other integer operations.
 // Repeated calls can accumulate error; use CP_TARGET_C / this function
 // for reference arithmetic, or raise the working bit depth before processing
 // to reduce the normalized size of 1 LSB.

@@ -554,6 +554,31 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     const auto* mp = masked ? reinterpret_cast<const float*>(address(*mask, 0, y)) : nullptr;
     auto* dst = reinterpret_cast<float*>(address(output, 0, y));
     size_t x = 0;
+    if constexpr (operation == CP_MIX && masked) {
+      if (opacity_value > 0 && opacity_value <= .75) {
+        const hn::ScalableTag<float> fast;
+        const size_t fn = hn::Lanes(fast);
+        const auto onef = hn::Set(fast, 1.f), zerof = hn::Zero(fast);
+        const auto of = hn::Set(fast, float(opacity_value));
+        for (; x + fn <= width; x += fn) {
+          const auto af = hn::LoadU(fast, ap + x), bf = hn::LoadU(fast, bp + x);
+          const auto mf = hn::LoadU(fast, mp + x);
+          const auto bounded = hn::And(hn::Le(hn::Abs(af), onef), hn::Le(hn::Abs(bf), onef));
+          if (hn::AllTrue(fast, bounded)) {
+            // Bounded MIX has absolute error <= 8*float_epsilon. Keep the
+            // reference order; use wider lanes and avoid double conversions.
+            const auto wf = hn::Mul(of, mf);
+            const auto result = hn::Add(af, hn::Mul(hn::Sub(bf, af), wf));
+            hn::StoreU(hn::IfThenElse(hn::Eq(mf, zerof), af, result), fast, dst + x);
+          } else {
+            for (size_t half = 0; half < fn; half += n)
+              hn::StoreU(blend(hn::LoadU(df, ap + x + half), hn::LoadU(df, bp + x + half),
+                              hn::LoadU(df, mp + x + half)), df, dst + x + half);
+          }
+        }
+      }
+    }
+
     for (; x + n <= width; x += n)
       hn::StoreU(blend(hn::LoadU(df, ap + x), hn::LoadU(df, bp + x), masked ? hn::LoadU(df, mp + x) : hn::Zero(df)), df,
                  dst + x);
