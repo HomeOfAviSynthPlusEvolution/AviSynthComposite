@@ -256,16 +256,26 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
                            hn::Mul(hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, mask_rows[0] + x))), reciprocal))
                  : opacity;
       const auto common_factor = hn::Add(one, hn::Mul(slope, common_weight));
-      if constexpr (approximate && !masked) {
-        // Keep the approximate unmasked loop free of channel selection and
+      if constexpr (approximate) {
+        // Keep approximate loops free of channel selection and
         // rounding-boundary work. Load all channels before any aliased store.
         const auto ay = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[0] + x)));
         const auto au = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[1] + x)));
         const auto av = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[2] + x)));
+        const auto factor_for = [&](int p) HWY_ATTR {
+          if constexpr (masked) {
+            if (!shared) {
+              const auto mv = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, mask_rows[p] + x)));
+              return hn::Add(one, hn::Mul(slope, hn::Mul(opacity, hn::Mul(mv, reciprocal))));
+            }
+          }
+          return common_factor;
+        };
+        const auto uf = factor_for(1), vf = factor_for(2);
         const auto chroma_round = hn::Add(center, half);
         const auto yy = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(ay, common_factor), half));
-        const auto uu = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(au, center), common_factor), chroma_round));
-        const auto vv = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(av, center), common_factor), chroma_round));
+        const auto uu = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(au, center), uf), chroma_round));
+        const auto vv = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(av, center), vf), chroma_round));
         hn::StoreU(hn::DemoteTo(dt, yy), dt, dest[0] + x);
         hn::StoreU(hn::DemoteTo(dt, uu), dt, dest[1] + x);
         hn::StoreU(hn::DemoteTo(dt, vv), dt, dest[2] + x);
