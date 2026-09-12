@@ -912,7 +912,7 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
 // Float YUV supports only Add/Subtract here. Resolve operation and masking
 // once, and use direct contiguous loads except for the bounded final vector.
 // Arithmetic stays binary64, including the original desaturation division.
-template <bool add, bool masked>
+template <bool add, bool masked, bool shared = false>
 void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, const cp_const_yuv* masks,
                          cp_yuv output, cp_rows r) {
   const hn::ScalableTag<double> d;
@@ -922,6 +922,14 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
   const cp_const_plane a[3]{base.y, base.u, base.v}, b[3]{source.y, source.u, source.v};
   const cp_const_plane m[3]{masked ? masks->y : cp_const_plane{}, masked ? masks->u : cp_const_plane{},
                             masked ? masks->v : cp_const_plane{}};
+  if constexpr (masked && !shared) {
+    if (m[0].data == m[1].data && m[0].data == m[2].data &&
+        m[0].stride == m[1].stride && m[0].stride == m[2].stride &&
+        m[0].step == m[1].step && m[0].step == m[2].step) {
+      FloatYuvAddSubtract<add, masked, true>(c, base, source, masks, output, r);
+      return;
+    }
+  }
   const cp_plane out[3]{output.y, output.u, output.v};
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
   for (int y = r.first; y < r.first + r.count; ++y) {
@@ -946,12 +954,15 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
           return LoadChannel(dt, plane, x, y, count);
       };
       const auto original_y = load(a[0], ap[0]), original_u = load(a[1], ap[1]), original_v = load(a[2], ap[2]);
-      auto unchanged = hn::Eq(zero, zero);
+      const auto opacity = hn::Set(d, opacity_value);
+      const auto common_weight = masked && shared
+          ? hn::Mul(opacity, hn::PromoteTo(d, load(m[0], mp[0]))) : opacity;
+      auto unchanged = shared ? hn::Eq(common_weight, zero) : hn::Eq(zero, zero);
       const auto blend = [&](auto original, int p) HWY_ATTR {
-        const auto opacity = hn::Set(d, opacity_value), zero = hn::Zero(d);
         const auto av = hn::PromoteTo(d, original), bv = hn::PromoteTo(d, load(b[p], bp[p]));
-        const auto weight = masked ? hn::Mul(opacity, hn::PromoteTo(d, load(m[p], mp[p]))) : opacity;
-        unchanged = hn::And(unchanged, hn::Eq(weight, zero));
+        const auto weight = masked && !shared ? hn::Mul(opacity, hn::PromoteTo(d, load(m[p], mp[p]))) : common_weight;
+        if (!shared)
+          unchanged = hn::And(unchanged, hn::Eq(weight, zero));
         const auto delta = hn::Mul(bv, weight);
         return add ? hn::Add(av, delta) : hn::Sub(av, delta);
       };
