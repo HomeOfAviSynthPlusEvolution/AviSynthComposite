@@ -44,10 +44,17 @@ struct Image {
   }
 };
 template <class T>
-void same(const Image<T>& a, const Image<T>& b, const char* label) {
+void same(const Image<T>& a, const Image<T>& b, const char* label, int tolerance = 0) {
   CHECK(a.data.size() == b.data.size());
   for (size_t i = 0; i < a.data.size(); ++i)
     if (std::memcmp(&a.data[i], &b.data[i], sizeof(T))) {
+      bool pixel = false;
+      for (int y = 0; y < a.h; ++y) {
+        const auto x = ptrdiff_t(i) - a.origin - y * a.pitch;
+        pixel = pixel || (x >= 0 && x < a.w * a.step && x % a.step == 0);
+      }
+      if (tolerance && pixel && std::abs(double(a.data[i]) - double(b.data[i])) <= tolerance)
+        continue;
       if constexpr (std::is_same<T, float>::value)
         if (std::isnan(a.data[i]) && std::isnan(b.data[i]))
           continue;
@@ -118,9 +125,10 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
                      mv = {m[0].in(), m[1].in(), m[2].in()};
   const cp_rows band = {width, 4, 1, 2};
   for (int mode = CP_YUV_ADD; mode <= CP_YUV_MULTIPLY; ++mode)
-    for (double opacity : {0.0, .003, .5, .63, 1.0})
+    for (double opacity : {0.0, .003, .17, .5, .63, 1.0})
       for (bool masked : {false, true}) {
         cp_yuv_config c = {f, mode, opacity};
+        const int tolerance = bits != 32 && mode == CP_YUV_MULTIPLY && opacity * 256 != std::floor(opacity * 256) ? 1 : 0;
         const cp_yuv gv = {got[0].out(), got[1].out(), got[2].out()}, rv = {ref[0].out(), ref[1].out(), ref[2].out()};
         const int expected = bits == 32 && mode > CP_YUV_SUBTRACT && mode != CP_YUV_MULTIPLY ? CP_UNSUPPORTED : CP_OK;
         CHECK(k->process_yuv(&c, av, bv, masked ? &mv : nullptr, gv, band) == expected);
@@ -130,14 +138,14 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
           std::snprintf(context, sizeof(context),
                         "yuv bits=%d width=%d step=%d negative=%d mode=%d opacity=%g mask=%d plane=%d", bits, width,
                         step, negative, mode, opacity, masked, p);
-          same(got[p], ref[p], context);
+          same(got[p], ref[p], context, tolerance);
           if (mode == CP_YUV_MULTIPLY) {
             const double center = p == 0 || bits == 32 ? 0 : double(1u << (bits - 1));
             const cp_plane_config plane{f, CP_GUIDED_MULTIPLY, opacity, center, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
             const auto mask_plane = m[p].in(), guide = b[0].in();
             CHECK(cp_process_plane(&plane, a[p].in(), b[p].in(), masked ? &mask_plane : nullptr, nullptr, &guide,
                                    ref[p].out(), band) == CP_OK);
-            same(got[p], ref[p], "fused versus plane multiply");
+            same(got[p], ref[p], "fused versus plane multiply", tolerance);
           }
         }
         // Snapshot guides, masks and all channels must precede writes within each pixel.
@@ -150,7 +158,7 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
         CHECK(cp_process_yuv(&c, {ref[0].in(), ref[1].in(), ref[2].in()}, bv, masked ? &mv : nullptr, rv, band) ==
               expected);
         for (int p = 0; p < 3; ++p)
-          same(got[p], ref[p], "yuv in-place");
+          same(got[p], ref[p], "yuv in-place", tolerance);
         if (mode == CP_YUV_MULTIPLY) {
           // Source Y is also the guide, and masks may alias the destination.
           // All three channels must see the original guide before Y is stored.
@@ -163,7 +171,7 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
           CHECK(k->process_yuv(&c, av, gs, masked ? &gs : nullptr, gv, band) == CP_OK);
           CHECK(cp_process_yuv(&c, av, rs, masked ? &rs : nullptr, rv, band) == CP_OK);
           for (int p = 0; p < 3; ++p)
-            same(got[p], ref[p], "multiply source and mask in-place");
+            same(got[p], ref[p], "multiply source and mask in-place", tolerance);
         }
       }
   cp_yuv_config c = {f, CP_YUV_ADD, .5};
@@ -250,7 +258,7 @@ static void FloatYuvEdges(const cp_kernels* k) {
           mv{m[0].in(), m[1].in(), m[2].in()};
       const cp_rows band{257, 3, 1, 1};
       for (int op : {CP_YUV_ADD, CP_YUV_SUBTRACT})
-        for (double opacity : {0.0, .003, .5, .63, 1.0})
+        for (double opacity : {0.0, .003, .17, .5, .63, 1.0})
           for (bool masked : {false, true}) {
             const cp_yuv_config c{format(32), op, opacity};
             auto got = b, ref = b;
@@ -491,7 +499,7 @@ void MultiplyRounding(const cp_kernels* k, int bits) {
     }
   }
   std::vector<double> opacities{0.0, std::nextafter(.5, 0.0),  .5, std::nextafter(.5, 1.0), .625,
-                                .37, std::nextafter(1.0, 0.0), 1.0};
+                                .17, .37, std::nextafter(1.0, 0.0), 1.0};
   if (bits == 8)
     for (int level = 1; level < 256; ++level)
       opacities.push_back(level / 256.0);
@@ -513,7 +521,7 @@ void MultiplyRounding(const cp_kernels* k, int bits) {
         const auto mv = mask.in(), gv = guide.in();
         CHECK(cp_process_plane(&plane, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, ref.out(), a.rows()) ==
               CP_OK);
-        same(channel == 0 ? got : channel == 1 ? u : v, ref, "multiply rounding boundary");
+        same(channel == 0 ? got : channel == 1 ? u : v, ref, "multiply rounding boundary", opacity * 256 != std::floor(opacity * 256) ? 1 : 0);
       }
     }
   }

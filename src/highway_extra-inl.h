@@ -220,7 +220,7 @@ void MultiplyYuvU8Dyadic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
 // 16u*M = 8*epsilon*M. Tiny/subnormal weights obey the same absolute bound.
 // Recompute samples near a half-integer in the original order. This keeps
 // exact integer outputs while usually processing twice as many SIMD lanes.
-template <class T, bool masked>
+template <class T, bool masked, bool approximate = false>
 void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source,
                                const cp_const_yuv* masks, cp_yuv output, cp_rows r) {
   const hn::ScalableTag<float> d;
@@ -273,7 +273,7 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
             hn::Abs(hn::Sub(candidate, hn::ConvertTo(d, VectorChannel(result_0, result_1, result_2, p))));
         VectorChannel(uncertain_0, uncertain_1, uncertain_2, p) = hn::Ge(distance, hn::Sub(half, tolerance));
       }
-      if (!hn::AllFalse(d, hn::Or(uncertain_0, hn::Or(uncertain_1, uncertain_2)))) {
+      if (!approximate && !hn::AllFalse(d, hn::Or(uncertain_0, hn::Or(uncertain_1, uncertain_2)))) {
         HWY_ALIGN int32_t corrected[3][hn::MaxLanes(d)];
         const hn::ScalableTag<double> dd;
         const hn::Rebind<float, decltype(dd)> dh;
@@ -662,6 +662,16 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
   if constexpr (!masked) {
     if (contiguous && c->opacity == 1) {
       MultiplyYuvFull<T>(c, base, source, output, r);
+      return;
+    }
+  }
+  // For canonical integer inputs the binary32 error is bounded by
+  // 8*epsilon*M < 0.063 through 16 bits, hence final rounding differs
+  // by at most one code. Keep dyadic and full-opacity exact kernels.
+  if constexpr (!std::is_same<T, float>::value) {
+    const double level = c->opacity * 256;
+    if (c->opacity > 0 && c->opacity < 1 && level != std::floor(level)) {
+      MultiplyYuvFloatCandidate<T, masked, true>(c, base, source, masks, output, r);
       return;
     }
   }

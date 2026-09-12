@@ -83,8 +83,9 @@ when `inversion_sum` is integral and in [0,65535], also with at most 1 LSB error
 Masked integer continuous MIX and INVERT_MIX (`inversion_sum == maximum`)
 may similarly quantize their combined effective weight to Q16 within 1 LSB;
 noncanonical narrow-U16 inputs retain scalar evaluation. Exact zero-weight and
-full-weight endpoints are preserved. This allowance does not extend to other
-operations, code weights, or F32. Repeated
+full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for non-dyadic opacity, as
+described below. These allowances do not extend to other operations, code weights,
+or F32. Repeated
 operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
 for reference arithmetic; increasing working bit depth before processing reduces
 the normalized size of a code-value error.
@@ -166,7 +167,7 @@ existing half-maximum neutral. These are distinct arithmetic contracts.
 Inputs are deterministic. Before timing, every backend is checked against the C
 reference, including untouched samples; local backends must be bit-exact except
 for the documented 1 LSB allowance for integer continuous MIX and
-INVERT_MIX. Upstream
+INVERT_MIX, and integer Overlay Multiply. Upstream
 integer Layer results must be exact and float results within 2e-7 (the existing
 Layer fixture tolerance). Any mismatch fails the run. Each timed call follows a
 reset from the same base, with two warmups and the requested measured trials;
@@ -234,3 +235,8 @@ AviSynthMinus. Original AviSynth copyright includes Ben Rudiak-Gould and other
 contributors; Overlay was originally written by Klaus Post (2003–2004). This
 implementation also draws on the subsequent AviSynth+ contributors' fixes and
 semantic clarifications. No upstream golden source is distributed in this tree.
+
+Integer YUV Overlay Multiply may use binary32 SIMD for non-dyadic opacity
+(weights not exactly k/256). For canonical input codes, the final output differs
+from the scalar reference by at most 1 LSB. Zero and full opacity retain their
+existing exact behavior; floating-point formats are unchanged.
