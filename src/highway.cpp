@@ -642,6 +642,10 @@ int Compat(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_plane
       return AverageRows<uint8_t>(a, b, output, r);
     return AverageRows<uint16_t>(a, b, output, r);
   }
+  // Smaller byte batches avoid the wide staging buffers on stepped channels.
+  // Scaling both weights and the rounding term by 128 preserves /256 rounding.
+  if (f.storage == CP_U8 && !mask && (a.step != 1 || b.step != 1 || output.step != 1))
+    return WeightedRows<uint8_t>(a, b, output, r, static_cast<uint32_t>(opacity) * 128);
   if (f.storage == CP_U8)
     CompatRows<uint8_t>(f, a, b, mask, output, r, opacity);
   else
