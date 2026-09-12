@@ -256,6 +256,21 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
                            hn::Mul(hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, mask_rows[0] + x))), reciprocal))
                  : opacity;
       const auto common_factor = hn::Add(one, hn::Mul(slope, common_weight));
+      if constexpr (approximate && !masked) {
+        // Keep the approximate unmasked loop free of channel selection and
+        // rounding-boundary work. Load all channels before any aliased store.
+        const auto ay = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[0] + x)));
+        const auto au = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[1] + x)));
+        const auto av = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[2] + x)));
+        const auto chroma_round = hn::Add(center, half);
+        const auto yy = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(ay, common_factor), half));
+        const auto uu = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(au, center), common_factor), chroma_round));
+        const auto vv = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(av, center), common_factor), chroma_round));
+        hn::StoreU(hn::DemoteTo(dt, yy), dt, dest[0] + x);
+        hn::StoreU(hn::DemoteTo(dt, uu), dt, dest[1] + x);
+        hn::StoreU(hn::DemoteTo(dt, vv), dt, dest[2] + x);
+        continue;
+      }
       hn::VFromD<decltype(di)> result_0, result_1, result_2;
       hn::MFromD<decltype(d)> uncertain_0, uncertain_1, uncertain_2;
       for (int p = 0; p < 3; ++p) {
