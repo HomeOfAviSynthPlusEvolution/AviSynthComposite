@@ -82,7 +82,7 @@ hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
 // Exact dyadic weights need no floating-point arithmetic. Convex blends sum
 // to at most 65535*32768+16384; Add/Subtract bounds are documented below.
 // The MIX dispatcher may also round continuous opacity to Q15 (<=1 LSB).
-template <class T, int operation = CP_MIX>
+template <class T, int operation = CP_MIX, int fractional_bits = 15>
 int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
                  uint32_t maximum_code = std::numeric_limits<T>::max(), uint32_t offset = 0) {
   const hn::ScalableTag<uint32_t> d;
@@ -90,7 +90,8 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T);
   const auto blend = [&](auto av, auto bv) HWY_ATTR {
-    const auto w = hn::Set(d, weight), inv = hn::Set(d, 32768 - weight), round = hn::Set(d, 16384);
+    const auto w = hn::Set(d, weight), inv = hn::Set(d, (1u << fractional_bits) - weight),
+               round = hn::Set(d, 1u << (fractional_bits - 1));
     const auto base = hn::PromoteTo(d, av);
     auto target = hn::PromoteTo(d, bv);
     if constexpr (operation == CP_PRODUCT)
@@ -102,7 +103,7 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
       const auto positive = hn::Add(operation == CP_DIFFERENCE ? hn::ShiftLeft<15>(base) : hn::Mul(base, inv),
                                     hn::Mul(hn::Set(d, offset), w));
       const auto negative = hn::Mul(target, w);
-      const auto value = hn::ShiftRight<15>(hn::Add(hn::Sub(hn::Max(positive, negative), negative), round));
+      const auto value = hn::ShiftRight<fractional_bits>(hn::Add(hn::Sub(hn::Max(positive, negative), negative), round));
       return hn::DemoteTo(dt, hn::Min(value, hn::Set(d, maximum_code)));
     } else if constexpr (operation == CP_SUBTRACT) {
       const hn::Rebind<int32_t, hn::ScalableTag<uint32_t>> di;
@@ -462,6 +463,15 @@ HWY_NOINLINE int OffsetPlaneRows(const cp_plane_config* c, cp_const_plane a, cp_
   return c->operation == CP_INVERT_MIX ? WeightedRows<uint16_t, CP_INVERT_MIX>(a, b, output, r, weight, max, offset)
                                        : WeightedRows<uint16_t, CP_DIFFERENCE>(a, b, output, r, weight, max, offset);
 }
+HWY_NOINLINE int QuantizedInvertRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cp_plane output,
+                                     cp_rows r) {
+  const auto weight = static_cast<uint32_t>(std::floor(c->opacity * 65536 + .5));
+  const auto max = static_cast<uint32_t>(maximum(c->format));
+  const auto offset = static_cast<uint32_t>(c->inversion_sum);
+  if (c->format.storage == CP_U8)
+    return WeightedRows<uint8_t, CP_INVERT_MIX, 16>(a, b, output, r, weight, max, offset);
+  return WeightedRows<uint16_t, CP_INVERT_MIX, 16>(a, b, output, r, weight, max, offset);
+}
 int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
           const cp_const_plane* ga, const cp_const_plane* gb, cp_plane output, cp_rows r) {
   const int status = check_plane(c, a, b, mask, ga, gb, output, r);
@@ -528,6 +538,13 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
       return OffsetPlaneRows(c, a, b, output, r, static_cast<uint32_t>(weight32768), static_cast<uint32_t>(offset));
   }
   // At full opacity, continuous and code mask weights are identical.
+  // Q16 bounds the error even when offset-a-b spans [-131070,65535].
+  // The positive convex sum and its rounding fit uint32_t for offset<=65535.
+  if (c->operation == CP_INVERT_MIX && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
+      c->format.storage != CP_F32 && c->inversion_sum >= 0 && c->inversion_sum <= 65535 &&
+      c->inversion_sum == std::floor(c->inversion_sum))
+    return QuantizedInvertRows(c, a, b, output, r);
+
   if (c->format.storage != CP_F32 && (c->weight_rule == CP_WEIGHT_CODE || c->opacity == 1) &&
       (c->operation == CP_MIX || c->operation == CP_PRODUCT)) {
     if (c->format.storage == CP_U8)

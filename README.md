@@ -78,7 +78,9 @@ have finished. No function allocates memory or modifies global dispatch state.
 For unmasked integer `CP_MIX` with `CP_WEIGHT_CONTINUOUS`, SIMD backends may
 round opacity to Q15 (`round(opacity * 32768) / 32768`). Results differ from
 the double scalar reference by at most **1 LSB per call**, including rounding
-boundaries. Exact opacity 0 and 1 retain exact copies. This allowance does not
+boundaries. Unmasked integer continuous `CP_INVERT_MIX` may use Q16 weights
+when `inversion_sum` is integral and in [0,65535], also with at most 1 LSB error.
+Exact opacity 0 and MIX opacity 1 retain exact copies. This allowance does not
 extend to masked mixing, other operations, code weights, or F32. Repeated
 operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
 for reference arithmetic; increasing working bit depth before processing reduces
@@ -160,7 +162,8 @@ existing half-maximum neutral. These are distinct arithmetic contracts.
 
 Inputs are deterministic. Before timing, every backend is checked against the C
 reference, including untouched samples; local backends must be bit-exact except
-for the documented 1 LSB allowance for unmasked integer continuous MIX. Upstream
+for the documented 1 LSB allowance for unmasked integer continuous MIX and
+INVERT_MIX. Upstream
 integer Layer results must be exact and float results within 2e-7 (the existing
 Layer fixture tolerance). Any mismatch fails the run. Each timed call follows a
 reset from the same base, with two warmups and the requested measured trials;

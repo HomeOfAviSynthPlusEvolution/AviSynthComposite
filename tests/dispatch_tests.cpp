@@ -138,7 +138,8 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
               c.threshold = bits == 32 ? double(std::numeric_limits<float>::epsilon() / 2) : 7;
             CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pd, rows) == CP_OK);
             CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pe, rows) == CP_OK);
-            if (bits != 32 && op == CP_MIX && rule == CP_WEIGHT_CONTINUOUS && !masked && opacity == .17) {
+            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX) &&
+                rule == CP_WEIGHT_CONTINUOUS && !masked && opacity == .17) {
               for (int y = rows.first; y < rows.first + rows.count; ++y)
                 for (int x = 0; x < width; ++x) {
                   const int i = origin + (negative ? -stride : stride) * y + x * step;
@@ -257,7 +258,13 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   const auto check = [&]() {
     CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {expected.data(), pitch, sizeof(T)}, rows) == CP_OK);
     CHECK(k->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
-    CHECK(got == expected);
+    if (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
+        c.inversion_sum == std::floor(c.inversion_sum)) {
+      for (int i = 0; i < count; ++i)
+        CHECK(std::abs(int(got[i]) - int(expected[i])) <= 1);
+    } else {
+      CHECK(got == expected);
+    }
   };
   for (int operation : {CP_PRODUCT, CP_ADD, CP_SUBTRACT}) {
     c.operation = operation;
@@ -295,7 +302,7 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   }
 }
 template <class T>
-static void QuantizedMix(const cp_kernels* k, int bits) {
+static void QuantizedMix(const cp_kernels* k, int bits, int operation = CP_MIX) {
   const int count = 65539, maximum = (1 << bits) - 1;
   std::vector<T> a(count), b(count), got(count), ref(count);
   std::mt19937 rng(2718 + bits);
@@ -320,7 +327,8 @@ static void QuantizedMix(const cp_kernels* k, int bits) {
   for (double opacity : weights) {
     cp_plane_config c{};
     c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
-    c.operation = CP_MIX; c.opacity = opacity; c.weight_rule = CP_WEIGHT_CONTINUOUS;
+    c.operation = operation; c.opacity = opacity; c.weight_rule = CP_WEIGHT_CONTINUOUS;
+    c.inversion_sum = maximum;
     CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {ref.data(), pitch, sizeof(T)}, rows) == CP_OK);
     for (int alias = 0; alias != 3; ++alias) {
       got = alias == 2 ? b : a;
@@ -375,8 +383,11 @@ int main() {
         }
     U8MaskedMixRounding(table);
     QuantizedMix<uint8_t>(table, 8);
+    QuantizedMix<uint8_t>(table, 8, CP_INVERT_MIX);
     for (int bits = 9; bits <= 16; ++bits)
       QuantizedMix<uint16_t>(table, bits);
+    for (int bits = 9; bits <= 16; ++bits)
+      QuantizedMix<uint16_t>(table, bits, CP_INVERT_MIX);
     ContinuousIntegerRounding<uint8_t>(table, 8);
     for (int bits = 9; bits <= 16; ++bits)
       ContinuousIntegerRounding<uint16_t>(table, bits);
