@@ -41,10 +41,12 @@ typedef struct cp_yuv_config {
 // Integer SIMD MULTIPLY with interior opacity (0 < opacity < 1) may differ
 // from scalar by at most 1 LSB for canonical codes. Integer zero/full opacity
 // retains its existing behavior. Integer inputs must fit the declared depth.
-// Continuous unmasked or shared-mask F32 MULTIPLY with 0 < opacity <= .75 may use
-// binary32 arithmetic for finite colors and guide Y in [0,1]. Error is at most
-// 8*FLT_EPSILON*abs(reference) + 2*FLT_TRUE_MIN. Zero mask copies exactly;
-// other cases retain reference arithmetic. F32 colors outside [0,1] remain valid.
+// Continuous unmasked/shared-mask F32 MULTIPLY may use binary32 for all opacities
+// and finite colors/guides, including negative/HDR. Error <= 16*FLT_EPSILON*max(1,S),
+// S=abs(base)*((1-w)+abs(guideY)*w), w=opacity*mask (or opacity without mask).
+// Zero mask and full-weight endpoints retain reference semantics. Nonfinite,
+// near-overflow and ill-conditioned near-full blends retain reference arithmetic.
+// See README for details. F32 color excursions remain valid.
 // Use cp_process_yuv for reference arithmetic on valid inputs.
 // F32 supports Add/Subtract/Multiply. Other artistic modes reject float. Integer artistic
 // modes (excluding MULTIPLY) desaturate UV on Y overshoot across 32*2^(bits-8) codes and saturates outputs.

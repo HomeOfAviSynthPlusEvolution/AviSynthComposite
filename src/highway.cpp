@@ -505,7 +505,8 @@ int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane 
   return CP_OK;
 }
 
-// Common float blends retain the scalar double evaluation order. Layout and
+// Common float blends retain reference double arithmetic outside the documented
+// finite-input fast paths. Layout and
 // operation dispatch happen before the row loop, not once per vector.
 template <int operation, bool masked, bool full_product = false, int center_mode = 0>
 int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
@@ -554,21 +555,51 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     const auto* mp = masked ? reinterpret_cast<const float*>(address(*mask, 0, y)) : nullptr;
     auto* dst = reinterpret_cast<float*>(address(output, 0, y));
     size_t x = 0;
-    if constexpr (operation == CP_MIX && masked) {
-      if (opacity_value > 0 && opacity_value <= .75) {
+    if constexpr ((operation == CP_MIX || operation == CP_PRODUCT) && masked) {
+      if (opacity_value > 0 && opacity_value <= 1) {
         const hn::ScalableTag<float> fast;
         const size_t fn = hn::Lanes(fast);
         const auto onef = hn::Set(fast, 1.f), zerof = hn::Zero(fast);
         const auto of = hn::Set(fast, float(opacity_value));
+        const auto io = hn::Set(fast, float(1.0 - opacity_value));
+        const auto safe = hn::Set(fast, std::numeric_limits<float>::max() *
+                                       (1.f - 64 * std::numeric_limits<float>::epsilon()));
         for (; x + fn <= width; x += fn) {
           const auto af = hn::LoadU(fast, ap + x), bf = hn::LoadU(fast, bp + x);
           const auto mf = hn::LoadU(fast, mp + x);
-          const auto bounded = hn::And(hn::Le(hn::Abs(af), onef), hn::Le(hn::Abs(bf), onef));
-          if (hn::AllTrue(fast, bounded)) {
-            // Bounded MIX has absolute error <= 8*float_epsilon. Keep the
-            // reference order; use wider lanes and avoid double conversions.
-            const auto wf = hn::Mul(of, mf);
-            const auto result = hn::Add(af, hn::Mul(hn::Sub(bf, af), wf));
+          const auto wf = hn::Mul(of, mf);
+          auto result = af;
+          auto exact_zero = hn::Eq(af, zerof);
+          if constexpr (operation == CP_PRODUCT) {
+            // Independent opacity complement preserves near-full weights.
+            const auto factor = opacity_value <= .75
+                ? hn::Add(onef, hn::Mul(wf, hn::Sub(bf, onef)))
+                : hn::Add(hn::Sub(onef, mf), hn::Mul(mf, hn::Add(io, hn::Mul(of, bf))));
+            result = hn::Mul(af, factor);
+            exact_zero = hn::Or(exact_zero, hn::Eq(factor, zerof));
+          } else {
+            if (opacity_value <= .75)
+              result = hn::Add(af, hn::Mul(hn::Sub(bf, af), wf));
+            else {
+              const auto keep = hn::Add(hn::Sub(onef, mf), hn::Mul(mf, io));
+              result = hn::Add(hn::Mul(af, keep), hn::Mul(bf, wf));
+            }
+          }
+          // Nonfinite inputs necessarily propagate to the candidate result.
+          auto valid = hn::Le(hn::Abs(result), safe);
+          // Preserve the reference subtraction order when near-full blending
+          // loses over 20 bits through cancellation of a very large base.
+          if (opacity_value > .75 && opacity_value < 1)
+            valid = hn::And(valid, hn::Le(hn::Abs(af), hn::Mul(hn::Set(fast, 1048576.f), hn::Max(onef, hn::Abs(result)))));
+          if (hn::AllTrue(fast, valid)) {
+            if constexpr (operation == CP_PRODUCT)
+              result = hn::IfThenElse(hn::And(hn::Eq(result, zerof), exact_zero), zerof, result);
+            else if (opacity_value > .75)
+              result = hn::IfThenElse(hn::And(hn::Eq(af, zerof), hn::Eq(bf, zerof)), zerof, result);
+            if (opacity_value == 1) {
+              const auto endpoint = operation == CP_MIX ? bf : hn::Mul(af, bf);
+              result = hn::IfThenElse(hn::Eq(mf, onef), endpoint, result);
+            }
             hn::StoreU(hn::IfThenElse(hn::Eq(mf, zerof), af, result), fast, dst + x);
           } else {
             for (size_t half = 0; half < fn; half += n)
@@ -578,7 +609,6 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
         }
       }
     }
-
     for (; x + n <= width; x += n)
       hn::StoreU(blend(hn::LoadU(df, ap + x), hn::LoadU(df, bp + x), masked ? hn::LoadU(df, mp + x) : hn::Zero(df)), df,
                  dst + x);

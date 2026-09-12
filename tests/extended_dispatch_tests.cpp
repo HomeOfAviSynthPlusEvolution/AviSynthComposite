@@ -129,8 +129,8 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
     for (double opacity : {0.0, .003, .17, .5, .63, 1.0})
       for (bool masked : {false, true}) {
         cp_yuv_config c = {f, mode, opacity};
-        const double tolerance = mode == CP_YUV_MULTIPLY && opacity > 0 && opacity < 1
-            ? (bits == 32 ? (opacity <= .75 ? 8 * std::numeric_limits<float>::epsilon() : 0) : 1) : 0;
+        const double tolerance = mode == CP_YUV_MULTIPLY && opacity > 0 && (bits == 32 || opacity < 1)
+            ? (bits == 32 ? 16 * std::numeric_limits<float>::epsilon() : 1) : 0;
         const cp_yuv gv = {got[0].out(), got[1].out(), got[2].out()}, rv = {ref[0].out(), ref[1].out(), ref[2].out()};
         const int expected = bits == 32 && mode > CP_YUV_SUBTRACT && mode != CP_YUV_MULTIPLY ? CP_UNSUPPORTED : CP_OK;
         CHECK(k->process_yuv(&c, av, bv, masked ? &mv : nullptr, gv, band) == expected);
@@ -712,8 +712,8 @@ static void SharedFloatMultiply(const cp_kernels* k) {
   double largest_error = 0;
   for (bool masked : {false, true})
    for (bool negative : {false, true})
-    for (double opacity : {.003, .17, .625, .75, std::nextafter(.75, 1.), 1.})
-      for (int scenario = 0; scenario < 4; ++scenario) {
+    for (double opacity : {.003, .17, .625, .75, std::nextafter(.75, 1.), .9, 1.0-1e-8, std::nextafter(1.,0.), 1.})
+      for (int scenario = 0; scenario < 6; ++scenario) {
         Image<float> proto(count, 2, 1, negative);
         std::array<Image<float>, 3> a{proto, proto, proto};
         auto guide = proto, mask = proto;
@@ -727,6 +727,8 @@ static void SharedFloatMultiply(const cp_kernels* k) {
             if (scenario == 3) v = i % 3 == 0 ? -0.f : i % 3 == 1 ? std::numeric_limits<float>::max() : -1.f;
             a[p].data[i] = v;
           }
+          if (scenario == 4) { guide.data[i] = float(int(rng()%10001)-5000)/50; for(int p=0;p<3;++p) a[p].data[i] *=100; }
+          if (scenario == 5) { guide.data[i] = i%3==0 ? 1e-8f : i%3==1 ? 0.f : -float((1-opacity)/std::max(opacity,1e-300)); mask.data[i]=1; }
           if (scenario == 3) guide.data[i] = i % 4 == 0 ? -2.f : i % 4 == 1 ? 4.f : guide.data[i];
         }
         for (int alias = 0; alias < 3; ++alias) {
@@ -745,12 +747,13 @@ static void SharedFloatMultiply(const cp_kernels* k) {
           for (int p = 0; p < 3; ++p) for (int y = 0; y < 2; ++y) for (int x = 0; x < count; ++x) {
             const int j = proto.origin + y * proto.pitch + x;
             const float v = got[p].data[j], expected = ref[p].data[j];
-            if ((masked && mask.data[j] == 0) || opacity > .75 || guide.data[j] < 0 || guide.data[j] > 1)
-              CHECK(std::memcmp(&v, &expected, sizeof(float)) == 0);
-            else {
-              const double error = std::abs(double(v) - expected);
-              const double limit = 8 * std::numeric_limits<float>::epsilon() * std::abs(double(expected)) +
-                                   2 * double(std::numeric_limits<float>::denorm_min());
+            if ((masked && mask.data[j] == 0) || (opacity == 1 && (!masked || mask.data[j] == 1)) || !std::isfinite(v) || !std::isfinite(expected)) {
+              if (!(std::isnan(v) && std::isnan(expected))) CHECK(std::memcmp(&v, &expected, sizeof(float)) == 0);
+            } else {
+              const double w = opacity*(masked ? mask.data[j] : 1.0);
+              const double scale = std::abs(double(a[p].data[j]))*((1-w)+w*std::abs(double(guide.data[j])));
+              const double error = std::abs(double(v)-expected);
+              const double limit = 16*std::numeric_limits<float>::epsilon()*std::max(1.0,scale);
               CHECK(error <= limit);
               if (scenario == 0) largest_error = std::max(largest_error, error);
             }

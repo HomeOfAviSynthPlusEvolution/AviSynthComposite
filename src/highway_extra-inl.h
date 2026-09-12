@@ -806,17 +806,20 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
   }
 }
 
-// Shared-mask F32 fast path. With guide in [0,1] and opacity <= .75,
-// the factor is in [.25,1], avoiding cancellation and overflow. The
-// relative error is bounded by 8*float_epsilon, plus subnormal rounding.
+// Finite F32 fast path with an input-scale error budget. Independent
+// opacity complements avoid cancellation when opacity approaches one.
 template <bool masked>
 void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b,
                             const cp_const_yuv* m, cp_yuv out, cp_rows r) {
+  const double opacity_value = c->opacity;
+  const bool low_opacity = opacity_value <= .75;
+  const bool near_full = opacity_value > .75 && opacity_value < 1;
   const hn::ScalableTag<float> d;
   const size_t n = hn::Lanes(d);
   const auto zero = hn::Zero(d), one = hn::Set(d, 1.f);
-  const auto opacity = hn::Set(d, float(c->opacity));
-  const auto largest = hn::Set(d, std::numeric_limits<float>::max());
+  const auto opacity = hn::Set(d, float(opacity_value)), inverse = hn::Set(d, float(1.0 - opacity_value));
+  const auto safe = hn::Set(d, std::numeric_limits<float>::max() *
+                               (1.f - 64 * std::numeric_limits<float>::epsilon()));
   for (int y = r.first; y < r.first + r.count; ++y) {
     size_t x = 0;
     for (; x + n <= size_t(r.width); x += n) {
@@ -825,9 +828,18 @@ void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv
       };
       const auto guide = load(b.y), mask = masked ? load(m->y) : one;
       const auto ay = load(a.y), au = load(a.u), av = load(a.v);
-      const auto finite = hn::And(hn::Le(hn::Abs(ay), largest),
-                         hn::And(hn::Le(hn::Abs(au), largest), hn::Le(hn::Abs(av), largest)));
-      if (!hn::AllTrue(d, hn::And(finite, hn::And(hn::Ge(guide, zero), hn::Le(guide, one))))) {
+      const auto factor = low_opacity
+          ? hn::Add(one, hn::Mul(hn::Mul(opacity, mask), hn::Sub(guide, one)))
+          : hn::Add(hn::Sub(one, mask), hn::Mul(mask, hn::Add(inverse, hn::Mul(opacity, guide))));
+      const auto ry = hn::Mul(ay, factor), ru = hn::Mul(au, factor), rv = hn::Mul(av, factor);
+      auto results = hn::And(hn::Le(hn::Abs(ry), safe), hn::And(hn::Le(hn::Abs(ru), safe), hn::Le(hn::Abs(rv), safe)));
+      if (near_full) {
+        const auto conditioned = [&](auto a, auto r) HWY_ATTR {
+          return hn::Le(hn::Abs(a), hn::Mul(hn::Set(d, 1048576.f), hn::Max(one, hn::Abs(r))));
+        };
+        results = hn::And(results, hn::And(conditioned(ay, ry), hn::And(conditioned(au, ru), conditioned(av, rv))));
+      }
+      if (!hn::AllTrue(d, results)) {
         const auto input = [&](cp_const_plane p) { return cp_const_plane{address(p, int(x), y), p.stride, p.step}; };
         const auto output = [&](cp_plane p) { return cp_plane{address(p, int(x), y), p.stride, p.step}; };
         const cp_const_yuv aa{input(a.y), input(a.u), input(a.v)}, bb{input(b.y), input(b.u), input(b.v)};
@@ -835,14 +847,12 @@ void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv
         MultiplyYuvRows<float, masked>(c, aa, bb, masked ? &mm : nullptr, {output(out.y), output(out.u), output(out.v)}, {int(n), 1, 0, 1});
         continue;
       }
-      const auto factor = hn::Sub(one, hn::Mul(hn::Mul(mask, opacity), hn::Sub(one, guide)));
-      const auto blend = [&](auto value) HWY_ATTR {
-        auto result = hn::Mul(value, factor);
-        // Reference interpolation makes a non-copy zero positive.
-        result = hn::IfThenElse(hn::Eq(result, zero), zero, result);
-        return hn::IfThenElse(hn::Eq(mask, zero), value, result);
+      const auto finish = [&](auto original, auto result) HWY_ATTR {
+        // Exact zero products add +0; negative underflow must retain -0.
+        result = hn::IfThenElse(hn::Or(hn::Eq(original, zero), hn::Eq(factor, zero)), zero, result);
+        return hn::IfThenElse(hn::Eq(mask, zero), original, result);
       };
-      const auto yy = blend(ay), uu = blend(au), vv = blend(av);
+      const auto yy = finish(ay, ry), uu = finish(au, ru), vv = finish(av, rv);
       hn::StoreU(yy, d, reinterpret_cast<float*>(address(out.y, int(x), y)));
       hn::StoreU(uu, d, reinterpret_cast<float*>(address(out.u, int(x), y)));
       hn::StoreU(vv, d, reinterpret_cast<float*>(address(out.v, int(x), y)));
@@ -1145,7 +1155,7 @@ int Yuv(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b, const cp_const_y
     return CP_INVALID_ARGUMENT;
 #if HWY_HAVE_FLOAT64
   if (c->operation == CP_YUV_MULTIPLY) {
-    if (c->format.storage == CP_F32 && m && c->opacity > 0 && c->opacity <= .75 &&
+    if (c->format.storage == CP_F32 && m && c->opacity > 0 && c->opacity <= 1 &&
         m->y.data == m->u.data && m->y.data == m->v.data &&
         m->y.stride == m->u.stride && m->y.stride == m->v.stride &&
         m->y.step == 4 && m->u.step == 4 && m->v.step == 4 &&
@@ -1157,10 +1167,7 @@ int Yuv(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b, const cp_const_y
     if (c->format.storage == CP_F32 && !m && c->opacity > 0 && c->opacity < 1 &&
         a.y.step == 4 && a.u.step == 4 && a.v.step == 4 && b.y.step == 4 &&
         out.y.step == 4 && out.u.step == 4 && out.v.step == 4) {
-      if (c->opacity <= .75)
-        MultiplyYuvFloatShared<false>(c, a, b, nullptr, out, r);
-      else
-        MultiplyYuvRows<float, false, true>(c, a, b, nullptr, out, r);
+      MultiplyYuvFloatShared<false>(c, a, b, nullptr, out, r);
       return CP_OK;
     }
     if (c->format.storage == CP_U8) {

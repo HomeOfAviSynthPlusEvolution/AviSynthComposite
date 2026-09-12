@@ -262,13 +262,22 @@ SIMD kernels do not scan for violations or guarantee scalar-equivalent results
 for them. Geometry and descriptor validation, and bounds-safe access, remain
 unchanged. F32 color excursions remain supported under their existing contract.
 
-F32 YUV Overlay Multiply with continuous planes with no mask or a shared mask and
-0 < opacity <= .75 may use binary32 arithmetic when guide Y is in [0,1]
-and the base colors are finite. Its error relative to scalar is bounded by
-`8 * FLT_EPSILON * abs(reference) + 2 * FLT_TRUE_MIN` (about 0.0000954%
-relative error, plus subnormal rounding). Zero mask preserves input bits.
-Out-of-range guide values, nonfinite colors and other configurations retain
-reference arithmetic. This does not restrict valid F32 color excursions.
-Use `cp_process_yuv` / `CP_TARGET_C` for reference arithmetic.
+F32 SIMD masked MIX and PRODUCT on continuous planes, and YUV Overlay Multiply
+on continuous planes with no mask or one shared mask, may use binary32
+arithmetic for every opacity in (0,1], including negative colors and HDR.
+The allowed error against the scalar result is
+`16 * FLT_EPSILON * max(1, S)`, with double-precision weight
+`w = opacity * mask` (or `opacity` without a mask):
 
-F32 masked MIX on continuous planes may use binary32 arithmetic for 0 < opacity <= .75 and inputs in [-1,1], with absolute error <= 8*FLT_EPSILON. Zero mask copies exactly; other inputs retain reference arithmetic. This applies to both weight rules; integer CODE behavior is unchanged.
+- MIX: `S = abs(a)*(1-w) + abs(b)*w`.
+- PRODUCT: `S = abs(a)*((1-w) + abs(b)*w)`.
+- YUV Multiply uses the PRODUCT scale for each base channel with source Y as `b`.
+
+For normalized nonnegative inputs this is at most 1.91e-6, or 0.125 of a
+16-bit code. This is an error allowance, not a claim that all cases reach it.
+Zero mask copies input bits, and full-weight endpoints retain reference semantics.
+Both F32 weight rules share this allowance; integer CODE behavior is unchanged.
+Nonfinite inputs or results, results within 64 float epsilons of overflow, and
+near-full blends whose base exceeds `2^20 * max(1, abs(candidate))` retain the
+reference calculation for the vector block. Other layouts retain existing kernels.
+Use `cp_process_plane`, `cp_process_yuv`, or `CP_TARGET_C` for reference arithmetic.
