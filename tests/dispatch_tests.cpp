@@ -139,11 +139,13 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
             CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pd, rows) == CP_OK);
             CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pe, rows) == CP_OK);
             if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX) &&
-                rule == CP_WEIGHT_CONTINUOUS && !masked && opacity == .17) {
+                rule == CP_WEIGHT_CONTINUOUS && opacity != 0) {
               for (int y = rows.first; y < rows.first + rows.count; ++y)
                 for (int x = 0; x < width; ++x) {
                   const int i = origin + (negative ? -stride : stride) * y + x * step;
-                  CHECK(std::abs(int(actual[i]) - int(expected[i])) <= 1);
+                  const bool exact = (masked && m[i] == 0) ||
+                      (op == CP_MIX && opacity == 1 && (!masked || m[i] == max));
+                  CHECK(std::abs(int(actual[i]) - int(expected[i])) <= (exact ? 0 : 1));
                   expected[i] = actual[i]; // Remaining bytes still require exact canary equality.
                 }
             }
@@ -207,7 +209,7 @@ static void FloatBlendSpecials(const cp_kernels* table) {
 }
 // All U8 input pairs with constant masks and neighboring opacities cover
 // both sides of rounding boundaries, including dense half-integer cases.
-void U8MaskedMixRounding(const cp_kernels* k) {
+void U8MaskedMixRounding(const cp_kernels* k, int operation = CP_MIX) {
   constexpr int count = 65537;
   std::vector<uint8_t> a(count), b(count), mask(count), got(count), expected(count);
   for (int i = 0; i < count; ++i) {
@@ -218,7 +220,8 @@ void U8MaskedMixRounding(const cp_kernels* k) {
   const cp_rows rows{count, 1, 0, 1};
   cp_plane_config c{};
   c.format = {CP_U8, 8};
-  c.operation = CP_MIX;
+  c.operation = operation;
+  c.inversion_sum = 255;
   c.weight_rule = CP_WEIGHT_CONTINUOUS;
   for (double opacity : {std::numeric_limits<double>::denorm_min(), .1, .17, std::nextafter(.5, 0.), .5,
                          std::nextafter(.5, 1.), .625, std::nextafter(1., 0.), 1.}) {
@@ -227,7 +230,8 @@ void U8MaskedMixRounding(const cp_kernels* k) {
       std::fill(mask.begin(), mask.end(), m);
       CHECK(cp_process_plane(&c, pa, pb, &pm, nullptr, nullptr, {expected.data(), count, 1}, rows) == CP_OK);
       CHECK(k->process_plane(&c, pa, pb, &pm, nullptr, nullptr, {got.data(), count, 1}, rows) == CP_OK);
-      CHECK(got == expected);
+      for (int i = 0; i < count; ++i)
+        CHECK(std::abs(int(got[i]) - int(expected[i])) <= ((m == 0 || (opacity == 1 && m == 255)) ? 0 : 1));
     }
   }
 }
@@ -344,6 +348,43 @@ static void QuantizedMix(const cp_kernels* k, int bits, int operation = CP_MIX) 
   }
 }
 
+template <class T>
+static void QuantizedMasked(const cp_kernels* k, int bits) {
+  constexpr int count = 65539;
+  const int max = (1 << bits) - 1;
+  std::vector<T> a(count), b(count), m(count), got(count), ref(count);
+  std::mt19937 rng(bits + 777);
+  for (int i = 0; i < count; ++i) {
+    a[i] = T(rng() & max); b[i] = T(rng() & max); m[i] = T(i & max);
+  }
+  const ptrdiff_t pitch = count * sizeof(T);
+  const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
+  const cp_rows rows{count, 1, 0, 1};
+  for (int op : {CP_MIX, CP_INVERT_MIX})
+    for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
+      for (bool noncanonical : {false, true}) {
+        // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
+        a[17] = noncanonical ? std::numeric_limits<T>::max() : T(max / 2);
+        m[count - 1] = noncanonical ? std::numeric_limits<T>::max() : T(max);
+        cp_plane_config c{};
+        c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
+        c.operation = op; c.opacity = opacity; c.inversion_sum = max; c.weight_rule = CP_WEIGHT_CONTINUOUS;
+        CHECK(cp_process_plane(&c, pa, pb, &pm, nullptr, nullptr, {ref.data(), pitch, sizeof(T)}, rows) == CP_OK);
+        for (int alias = 0; alias < 4; ++alias) {
+          got = alias == 2 ? b : alias == 3 ? m : a;
+          const cp_const_plane in{got.data(), pitch, sizeof(T)};
+          const cp_const_plane mask_in = alias == 3 ? in : pm;
+          CHECK(k->process_plane(&c, alias == 1 ? in : pa, alias == 2 ? in : pb, &mask_in, nullptr, nullptr,
+                                  {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
+          for (int i = 0; i < count; ++i) {
+            const bool exact = opacity == 0 || m[i] == 0 || (opacity == 1 && m[i] == max) ||
+                                a[i] > max || b[i] > max || m[i] > max;
+            CHECK(std::abs(int(got[i]) - int(ref[i])) <= (exact ? 0 : 1));
+          }
+        }
+      }
+}
+
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -382,6 +423,10 @@ int main() {
           Arithmetic<float>(table, 32, width, step, negative);
         }
     U8MaskedMixRounding(table);
+    U8MaskedMixRounding(table, CP_INVERT_MIX);
+    QuantizedMasked<uint8_t>(table, 8);
+    for (int bits = 9; bits <= 16; ++bits)
+      QuantizedMasked<uint16_t>(table, bits);
     QuantizedMix<uint8_t>(table, 8);
     QuantizedMix<uint8_t>(table, 8, CP_INVERT_MIX);
     for (int bits = 9; bits <= 16; ++bits)

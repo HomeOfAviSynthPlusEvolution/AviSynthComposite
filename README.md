@@ -80,8 +80,11 @@ round opacity to Q15 (`round(opacity * 32768) / 32768`). Results differ from
 the double scalar reference by at most **1 LSB per call**, including rounding
 boundaries. Unmasked integer continuous `CP_INVERT_MIX` may use Q16 weights
 when `inversion_sum` is integral and in [0,65535], also with at most 1 LSB error.
-Exact opacity 0 and MIX opacity 1 retain exact copies. This allowance does not
-extend to masked mixing, other operations, code weights, or F32. Repeated
+Masked integer continuous MIX and INVERT_MIX (`inversion_sum == maximum`)
+may similarly quantize their combined effective weight to Q16 within 1 LSB;
+noncanonical narrow-U16 inputs retain scalar evaluation. Exact zero-weight and
+full-weight endpoints are preserved. This allowance does not extend to other
+operations, code weights, or F32. Repeated
 operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
 for reference arithmetic; increasing working bit depth before processing reduces
 the normalized size of a code-value error.
@@ -162,7 +165,7 @@ existing half-maximum neutral. These are distinct arithmetic contracts.
 
 Inputs are deterministic. Before timing, every backend is checked against the C
 reference, including untouched samples; local backends must be bit-exact except
-for the documented 1 LSB allowance for unmasked integer continuous MIX and
+for the documented 1 LSB allowance for integer continuous MIX and
 INVERT_MIX. Upstream
 integer Layer results must be exact and float results within 2e-7 (the existing
 Layer fixture tolerance). Any mismatch fails the run. Each timed call follows a
