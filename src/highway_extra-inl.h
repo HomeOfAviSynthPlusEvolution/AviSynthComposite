@@ -551,11 +551,11 @@ HWY_NOINLINE void YuvSteppedPrepared(const cp_yuv_config* c, cp_const_yuv base, 
                             masked ? masks->v : cp_const_plane{}};
   const bool shared = !masked || (m[0].data == m[1].data && m[0].data == m[2].data && m[0].stride == m[1].stride &&
                                   m[0].stride == m[2].stride && m[0].step == m[1].step && m[0].step == m[2].step);
-  const auto in = [](const T* ptr) HWY_ATTR {
-    return cp_const_plane{ptr, tile * sizeof(T), sizeof(T)};
+  const auto in = [tile](const T* ptr) HWY_ATTR {
+    return cp_const_plane{ptr, static_cast<ptrdiff_t>(tile * sizeof(T)), sizeof(T)};
   };
-  const auto dest = [](T* ptr) HWY_ATTR {
-    return cp_plane{ptr, tile * sizeof(T), sizeof(T)};
+  const auto dest = [tile](T* ptr) HWY_ATTR {
+    return cp_plane{ptr, static_cast<ptrdiff_t>(tile * sizeof(T)), sizeof(T)};
   };
   const cp_const_yuv packed_base{in(pixels[0]), in(pixels[1]), in(pixels[2])};
   const cp_const_plane b[3]{source.y, source.u, source.v};
@@ -626,7 +626,8 @@ template <class T, bool masked>
 void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, const cp_const_yuv* masks,
                      cp_yuv output, cp_rows r) {
   const hn::ScalableTag<double> d;
-  const hn::Rebind<T, decltype(d)> dt;
+  using SampleTag = hn::Rebind<T, hn::ScalableTag<double>>;
+  const SampleTag dt;
   const hn::Rebind<float, decltype(d)> df;
   const hn::Rebind<uint32_t, decltype(d)> du;
   const hn::Rebind<int32_t, decltype(d)> di;
@@ -715,7 +716,9 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
           return LoadChannel(dt, plane, x, y, count);
       };
       const auto guide = promote(load(source.y, gp));
-      hn::VFromD<decltype(dt)> values_0, values_1, values_2;
+      // MSVC can treat decltype of a reference-captured tag as a reference here.
+      // Name the tag type directly so VFromD always receives a value type.
+      hn::VFromD<SampleTag> values_0, values_1, values_2;
       for (int p = 0; p < 3; ++p) {
         const auto original = load(a[p], ap[p]);
         const auto av = promote(original);
