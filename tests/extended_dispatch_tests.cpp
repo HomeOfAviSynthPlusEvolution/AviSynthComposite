@@ -578,12 +578,28 @@ void GuidedLimits(const cp_kernels* k, int bits) {
     for (double opacity : {.17, 1.0})
       for (bool masked : {false, true}) {
         const cp_plane_config c{f, CP_GUIDED_MULTIPLY, opacity, neutral, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+        const auto verify = [&](const char* label) {
+          const bool approximate = bits != 32 && opacity > 0 && opacity < 1 &&
+                                   neutral >= 0 && neutral <= maximum;
+          same(got, ref, label, approximate ? 1 : 0);
+          if (approximate) {
+            for (int y = 0; y < a.h; ++y)
+              for (int x = 0; x < a.w; ++x) {
+                const int i = a.origin + y * a.pitch + x * a.step;
+                // Approximation never changes zero-mask copies or the
+                // noncanonical-input fallback, including aliased inputs.
+                if (a.data[i] > maximum || guide.data[i] > maximum ||
+                    (masked && (mask.data[i] == 0 || mask.data[i] > maximum)))
+                  CHECK(got.data[i] == ref.data[i]);
+              }
+          }
+        };
         const auto mv = mask.in(), gv = guide.in();
         CHECK(k->process_plane(&c, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, got.out(), a.rows()) ==
               CP_OK);
         CHECK(cp_process_plane(&c, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, ref.out(), a.rows()) ==
               CP_OK);
-        same(got, ref, "guided extreme neutral and endpoint codes");
+        verify("guided extreme neutral and endpoint codes");
         // The guide and mask may be exact aliases of the destination.
         for (bool alias_mask : {false, true}) {
           got = ref = alias_mask ? mask : guide;
@@ -593,7 +609,7 @@ void GuidedLimits(const cp_kernels* k, int bits) {
                 CP_OK);
           CHECK(cp_process_plane(&c, a.in(), guide.in(), masked ? &rm : nullptr, nullptr, &rg, ref.out(), a.rows()) ==
                 CP_OK);
-          same(got, ref, "guided guide/mask in-place");
+          verify("guided guide/mask in-place");
         }
       }
 }
