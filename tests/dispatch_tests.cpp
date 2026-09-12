@@ -196,6 +196,32 @@ static void FloatBlendSpecials(const cp_kernels* table) {
           }
         }
 }
+// All U8 input pairs with constant masks and neighboring opacities cover
+// both sides of rounding boundaries, including dense half-integer cases.
+void U8MaskedMixRounding(const cp_kernels* k) {
+  constexpr int count = 65537;
+  std::vector<uint8_t> a(count), b(count), mask(count), got(count), expected(count);
+  for (int i = 0; i < count; ++i) {
+    a[i] = uint8_t(i);
+    b[i] = uint8_t(i >> 8);
+  }
+  const cp_const_plane pa{a.data(), count, 1}, pb{b.data(), count, 1}, pm{mask.data(), count, 1};
+  const cp_rows rows{count, 1, 0, 1};
+  cp_plane_config c{};
+  c.format = {CP_U8, 8};
+  c.operation = CP_MIX;
+  c.weight_rule = CP_WEIGHT_CONTINUOUS;
+  for (double opacity : {std::numeric_limits<double>::denorm_min(), .1, .17, std::nextafter(.5, 0.), .5,
+                         std::nextafter(.5, 1.), .625, std::nextafter(1., 0.), 1.}) {
+    c.opacity = opacity;
+    for (uint8_t m : {0, 1, 51, 85, 127, 128, 170, 254, 255}) {
+      std::fill(mask.begin(), mask.end(), m);
+      CHECK(cp_process_plane(&c, pa, pb, &pm, nullptr, nullptr, {expected.data(), count, 1}, rows) == CP_OK);
+      CHECK(k->process_plane(&c, pa, pb, &pm, nullptr, nullptr, {got.data(), count, 1}, rows) == CP_OK);
+      CHECK(got == expected);
+    }
+  }
+}
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -233,6 +259,7 @@ int main() {
             Arithmetic<uint16_t>(table, bits, width, step, negative);
           Arithmetic<float>(table, 32, width, step, negative);
         }
+    U8MaskedMixRounding(table);
     FloatEndpoints(table);
     FloatBlendSpecials(table);
   }

@@ -28,27 +28,32 @@ class Guarded {
 public:
   unsigned char* allocation;
   unsigned char* data;
-  size_t page, size;
+  size_t page, size, allocation_size;
   explicit Guarded(size_t bytes, bool at_end = true) : size(bytes) {
 #if defined(_WIN32)
     SYSTEM_INFO info;
     GetSystemInfo(&info);
     page = info.dwPageSize;
-    allocation = static_cast<unsigned char*>(VirtualAlloc(nullptr, page * 3, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
+#else
+    page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
+#endif
+    const size_t interior = ((size + page - 1) / page) * page;
+    allocation_size = interior + 2 * page;
+#if defined(_WIN32)
+    allocation =
+        static_cast<unsigned char*>(VirtualAlloc(nullptr, allocation_size, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE));
     CHECK(allocation);
     DWORD old;
     CHECK(VirtualProtect(allocation, page, PAGE_NOACCESS, &old));
-    CHECK(VirtualProtect(allocation + page * 2, page, PAGE_NOACCESS, &old));
+    CHECK(VirtualProtect(allocation + page + interior, page, PAGE_NOACCESS, &old));
 #else
-    page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
     allocation = static_cast<unsigned char*>(
-        mmap(nullptr, page * 3, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
+        mmap(nullptr, allocation_size, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0));
     CHECK(allocation != MAP_FAILED);
     CHECK(mprotect(allocation, page, PROT_NONE) == 0);
-    CHECK(mprotect(allocation + page * 2, page, PROT_NONE) == 0);
+    CHECK(mprotect(allocation + page + interior, page, PROT_NONE) == 0);
 #endif
-    CHECK(size <= page);
-    data = at_end ? allocation + page * 2 - size : allocation + page;
+    data = at_end ? allocation + page + interior - size : allocation + page;
     std::memset(data, 0xCD, size);
   }
   Guarded(const Guarded&) = delete;
@@ -57,7 +62,7 @@ public:
 #if defined(_WIN32)
     VirtualFree(allocation, 0, MEM_RELEASE);
 #else
-    munmap(allocation, page * 3);
+    munmap(allocation, allocation_size);
 #endif
   }
 };
@@ -213,10 +218,31 @@ void packed_yuv(const cp_kernels* k, int bits, int width, bool negative, bool re
   }
 }
 
+void large_masked_mix(const cp_kernels* k, int width) {
+  Guarded a(width), b(width), mask(width), out(width);
+  std::vector<unsigned char> reference(width);
+  const cp_const_plane pa{a.data, width, 1}, pb{b.data, width, 1}, pm{mask.data, width, 1};
+  const cp_plane_config config{{CP_U8, 8}, CP_MIX, .625, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+  const cp_rows rows{width, 1, 0, 1};
+  for (unsigned char* destination : {out.data, a.data, b.data, mask.data}) {
+    for (int i = 0; i < width; ++i) {
+      a.data[i] = static_cast<unsigned char>(i * 29);
+      b.data[i] = static_cast<unsigned char>(i * 37 + 81);
+      mask.data[i] = static_cast<unsigned char>(i * 73);
+    }
+    CHECK(cp_process_plane(&config, pa, pb, &pm, nullptr, nullptr, {reference.data(), width, 1}, rows) == CP_OK);
+    CHECK(k->process_plane(&config, pa, pb, &pm, nullptr, nullptr, {destination, width, 1}, rows) == CP_OK);
+    CHECK(std::memcmp(destination, reference.data(), width) == 0);
+  }
+}
+
 int main() {
   std::vector<int64_t> targets = {0};
   for (int64_t rest = cp_supported_targets(); rest; rest &= rest - 1)
     targets.push_back(rest & -rest);
+  for (auto target : targets)
+    for (int width : {65536, 65537, 65543})
+      large_masked_mix(cp_get_kernels(target), width);
   for (auto target : targets)
     for (int width : {1, 3, 7, 15, 16, 17, 31, 32, 33, 65, 127})
       for (bool negative : {false, true}) {

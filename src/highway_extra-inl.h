@@ -896,8 +896,7 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
   const hn::ScalableTag<double> d;
   using SampleTag = hn::Rebind<float, hn::ScalableTag<double>>;
   const SampleTag dt;
-  const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, c->opacity);
-  const auto over = hn::Set(d, 32.0 / 255), upper_limit = hn::Set(d, 1 + 32.0 / 255);
+  const double opacity_value = c->opacity;
   const cp_const_plane a[3]{base.y, base.u, base.v}, b[3]{source.y, source.u, source.v};
   const cp_const_plane m[3]{masked ? masks->y : cp_const_plane{}, masked ? masks->u : cp_const_plane{},
                             masked ? masks->v : cp_const_plane{}};
@@ -915,6 +914,8 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       dst[p] = reinterpret_cast<float*>(address(out[p], 0, y));
     }
     const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
+      const auto zero = hn::Zero(d), one = hn::Set(d, 1);
+      const auto over = hn::Set(d, 32.0 / 255), upper_limit = hn::Set(d, 1 + 32.0 / 255);
       const int x = static_cast<int>(xx);
       const auto load = [&](cp_const_plane plane, const float* ptr) HWY_ATTR {
         if constexpr (decltype(direct)::value)
@@ -925,6 +926,7 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       const auto original_y = load(a[0], ap[0]), original_u = load(a[1], ap[1]), original_v = load(a[2], ap[2]);
       auto unchanged = hn::Eq(zero, zero);
       const auto blend = [&](auto original, int p) HWY_ATTR {
+        const auto opacity = hn::Set(d, opacity_value), zero = hn::Zero(d);
         const auto av = hn::PromoteTo(d, original), bv = hn::PromoteTo(d, load(b[p], bp[p]));
         const auto weight = masked ? hn::Mul(opacity, hn::PromoteTo(d, load(m[p], mp[p]))) : opacity;
         unchanged = hn::And(unchanged, hn::Eq(weight, zero));
@@ -939,7 +941,8 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       // the opposite luma endpoint (float Add/Subtract deliberately differ).
       const auto keep = hn::IfThenElse(overflow, hn::IfThenElse(hn::Gt(fade, zero), fade, zero), one);
       vy = hn::IfThenElse(overflow, add ? one : zero, vy);
-      const auto desaturate = [&](auto value) HWY_ATTR {
+      const auto desaturate = [&](auto value, auto keep) HWY_ATTR {
+        const auto zero = hn::Zero(d), one = hn::Set(d, 1);
         auto faded = hn::Mul(value, keep);
         // Scalar chroma includes +0 after multiplication; retain its zero sign.
         faded = hn::IfThenElse(hn::Eq(faded, zero), zero, faded);
@@ -947,16 +950,16 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       };
       // All source, base and mask channels have been loaded before any store,
       // including original endpoint bits needed for exact in-place execution.
-      const auto store = [&](auto original, auto value, int p) HWY_ATTR {
+      const auto store = [&](auto original, auto value, auto unchanged, int p) HWY_ATTR {
         const auto result = hn::IfThenElse(NarrowMask(dt, d, unchanged), original, hn::DemoteTo(dt, value));
         if constexpr (decltype(direct)::value)
           hn::StoreU(result, dt, dst[p] + xx);
         else
           StoreChannel(result, dt, out[p], x, y, count);
       };
-      store(original_y, vy, 0);
-      store(original_u, desaturate(vu), 1);
-      store(original_v, desaturate(vv), 2);
+      store(original_y, vy, unchanged, 0);
+      store(original_u, desaturate(vu, keep), unchanged, 1);
+      store(original_v, desaturate(vv, keep), unchanged, 2);
     };
     size_t x = 0;
     for (; x < end; x += n)
@@ -1306,18 +1309,28 @@ void UnaryRows(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, doub
       const float lower = static_cast<float>(first), upper = static_cast<float>(second);
       if (double(lower) == first && double(upper) == second) {
         const hn::ScalableTag<float> d;
-        const auto low = hn::Set(d, lower), high = hn::Set(d, upper);
-        const size_t n = hn::Lanes(d);
-        for (int y = r.first; y < r.first + r.count; ++y)
-          for (size_t xx = 0; xx < size_t(r.width); xx += n) {
-            const int x = static_cast<int>(xx);
-            const size_t count = std::min(n, size_t(r.width) - xx);
-            const auto value = LoadChannel(d, source, x, y, count);
-            const auto result = hn::IfThenElse(
-                hn::IsNaN(value), low,
-                hn::IfThenElse(hn::Lt(value, low), low, hn::IfThenElse(hn::Gt(value, high), high, value)));
-            StoreChannel(result, d, out, x, y, count);
+        const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+        const bool contiguous = source.step == sizeof(float) && out.step == sizeof(float);
+        const auto clamp = [&](auto value) HWY_ATTR {
+          const auto low = hn::Set(d, lower), high = hn::Set(d, upper);
+          return hn::IfThenElse(
+              hn::IsNaN(value), low,
+              hn::IfThenElse(hn::Lt(value, low), low, hn::IfThenElse(hn::Gt(value, high), high, value)));
+        };
+        for (int y = r.first; y < r.first + r.count; ++y) {
+          size_t x = 0;
+          if (contiguous) {
+            const auto* src = reinterpret_cast<const float*>(address(source, 0, y));
+            auto* dst = reinterpret_cast<float*>(address(out, 0, y));
+            for (; x < end; x += n)
+              hn::StoreU(clamp(hn::LoadU(d, src + x)), d, dst + x);
           }
+          for (; x < width; x += n) {
+            const size_t count = std::min(n, width - x);
+            StoreChannel(clamp(LoadChannel(d, source, static_cast<int>(x), y, count)), d, out, static_cast<int>(x), y,
+                         count);
+          }
+        }
         return;
       }
     }
@@ -1386,45 +1399,78 @@ int Clamp(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, double a,
   return Unary<true>(f, source, out, r, a, b);
 }
 
-template <class T>
-void LumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
-  if constexpr (std::is_same<T, float>::value) {
-    if (rgb.r.step != 4 || rgb.g.step != 4 || rgb.b.step != 4 || out.step != 4) {
-      for (int y = r.first; y < r.first + r.count; ++y)
-        for (int x = 0; x < r.width; ++x) {
-          float rr, gg, bb;
-          std::memcpy(&rr, address(rgb.r, x, y), 4);
-          std::memcpy(&gg, address(rgb.g, x, y), 4);
-          std::memcpy(&bb, address(rgb.b, x, y), 4);
-          const float v = .114f * bb + .587f * gg + .299f * rr;
-          std::memcpy(address(out, x, y), &v, 4);
-        }
-      return;
-    }
+void FloatLumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r) {
+  if (rgb.r.step != 4 || rgb.g.step != 4 || rgb.b.step != 4 || out.step != 4) {
+    for (int y = r.first; y < r.first + r.count; ++y)
+      for (int x = 0; x < r.width; ++x) {
+        float rr, gg, bb;
+        std::memcpy(&rr, address(rgb.r, x, y), 4);
+        std::memcpy(&gg, address(rgb.g, x, y), 4);
+        std::memcpy(&bb, address(rgb.b, x, y), 4);
+        const float value = .114f * bb + .587f * gg + .299f * rr;
+        std::memcpy(address(out, x, y), &value, 4);
+      }
+    return;
   }
-  using Acc = typename std::conditional<std::is_same<T, float>::value, float, uint32_t>::type;
-  const hn::ScalableTag<Acc> d;
-  const hn::Rebind<T, decltype(d)> dt;
+  const hn::ScalableTag<float> d;
   const size_t n = hn::Lanes(d);
   for (int y = r.first; y < r.first + r.count; ++y)
-    for (size_t xx = 0; xx < static_cast<size_t>(r.width); xx += n) {
+    for (size_t xx = 0; xx < size_t(r.width); xx += n) {
       const int x = static_cast<int>(xx);
-      const size_t count = std::min(n, static_cast<size_t>(r.width) - xx);
-      const auto rr = LoadChannel(dt, rgb.r, x, y, count), gg = LoadChannel(dt, rgb.g, x, y, count),
-                 bb = LoadChannel(dt, rgb.b, x, y, count);
-      if constexpr (std::is_same<T, float>::value) {
-        const auto value = hn::Add(hn::Add(hn::Mul(hn::Set(d, .114f), bb), hn::Mul(hn::Set(d, .587f), gg)),
-                                   hn::Mul(hn::Set(d, .299f), rr));
-        StoreChannel(value, d, out, x, y, count);
-      } else {
-        auto value = hn::Add(
-            hn::Add(hn::Mul(hn::Set(d, 9798), hn::PromoteTo(d, rr)), hn::Mul(hn::Set(d, 19234), hn::PromoteTo(d, gg))),
-            hn::Mul(hn::Set(d, 3736), hn::PromoteTo(d, bb)));
-        value = hn::ShiftRight<15>(hn::Add(value, hn::Set(d, rounding == CP_LUMA_NEAREST ? 16384 : 0)));
-        StoreChannel(hn::DemoteTo(dt, value), dt, out, x, y, count);
-      }
+      const size_t count = std::min(n, size_t(r.width) - xx);
+      const auto rr = LoadChannel(d, rgb.r, x, y, count), gg = LoadChannel(d, rgb.g, x, y, count),
+                 bb = LoadChannel(d, rgb.b, x, y, count);
+      const auto value = hn::Add(hn::Add(hn::Mul(hn::Set(d, .114f), bb), hn::Mul(hn::Set(d, .587f), gg)),
+                                 hn::Mul(hn::Set(d, .299f), rr));
+      StoreChannel(value, d, out, x, y, count);
     }
 }
+
+template <class T>
+void IntegerLumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
+  using AccTag = hn::ScalableTag<uint32_t>;
+  const AccTag d;
+  const hn::Rebind<T, AccTag> dt;
+  const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+  const bool contiguous =
+      rgb.r.step == sizeof(T) && rgb.g.step == sizeof(T) && rgb.b.step == sizeof(T) && out.step == sizeof(T);
+  const auto luma = [&](auto rr, auto gg, auto bb) HWY_ATTR {
+    hn::VFromD<AccTag> rg;
+    if constexpr (std::is_same<T, uint8_t>::value) {
+      // U8 samples fit signed 16-bit lanes. One pairwise multiply-add
+      // replaces two 32-bit products without changing the integer sum.
+      const hn::Repartition<int16_t, AccTag> ds;
+      const hn::Rebind<int32_t, AccTag> di;
+      const auto pairs = hn::Or(hn::PromoteTo(d, rr), hn::ShiftLeft<16>(hn::PromoteTo(d, gg)));
+      const auto weights = hn::Set(d, 9798u | (19234u << 16));
+      rg = hn::BitCast(d, hn::WidenMulPairwiseAdd(di, hn::BitCast(ds, pairs), hn::BitCast(ds, weights)));
+    } else {
+      rg = hn::Add(hn::Mul(hn::Set(d, 9798), hn::PromoteTo(d, rr)), hn::Mul(hn::Set(d, 19234), hn::PromoteTo(d, gg)));
+    }
+    auto value = hn::Add(rg, hn::Mul(hn::Set(d, 3736), hn::PromoteTo(d, bb)));
+    value = hn::ShiftRight<15>(hn::Add(value, hn::Set(d, rounding == CP_LUMA_NEAREST ? 16384 : 0)));
+    return hn::DemoteTo(dt, value);
+  };
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    size_t x = 0;
+    if (contiguous) {
+      const auto* rp = reinterpret_cast<const T*>(address(rgb.r, 0, y));
+      const auto* gp = reinterpret_cast<const T*>(address(rgb.g, 0, y));
+      const auto* bp = reinterpret_cast<const T*>(address(rgb.b, 0, y));
+      auto* dst = reinterpret_cast<T*>(address(out, 0, y));
+      for (; x < end; x += n)
+        hn::StoreU(luma(hn::LoadU(dt, rp + x), hn::LoadU(dt, gp + x), hn::LoadU(dt, bp + x)), dt, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      const int xx = static_cast<int>(x);
+      StoreChannel(luma(LoadChannel(dt, rgb.r, xx, y, count), LoadChannel(dt, rgb.g, xx, y, count),
+                        LoadChannel(dt, rgb.b, xx, y, count)),
+                   dt, out, xx, y, count);
+    }
+  }
+}
+
 int Luma(cp_format f, cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
   if (!bytes(f) || !rows_ok(r) || (rounding != CP_LUMA_FLOOR && rounding != CP_LUMA_NEAREST))
     return CP_INVALID_ARGUMENT;
@@ -1434,11 +1480,11 @@ int Luma(cp_format f, cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
       !plane_ok(out, r, bytes(f)))
     return CP_INVALID_ARGUMENT;
   if (f.storage == CP_U8)
-    LumaRows<uint8_t>(rgb, out, r, rounding);
+    IntegerLumaRows<uint8_t>(rgb, out, r, rounding);
   else if (f.storage == CP_U16)
-    LumaRows<uint16_t>(rgb, out, r, rounding);
+    IntegerLumaRows<uint16_t>(rgb, out, r, rounding);
   else
-    LumaRows<float>(rgb, out, r, rounding);
+    FloatLumaRows(rgb, out, r);
   return CP_OK;
 }
 #if HWY_HAVE_FLOAT64

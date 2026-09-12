@@ -67,16 +67,18 @@ int AverageRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r) 
   return CP_OK;
 }
 
+// Construct vector constants inside arithmetic lambdas from scalar values.
+// Captured vector wrappers can make MSVC spill/reassemble their halves in hot loops.
 // Exact dyadic weights need no floating-point arithmetic. The largest sum is
 // 65535*32768+16384, safely below UINT32_MAX. No opacity quantization occurs.
 template <class T>
 int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight) {
   const hn::ScalableTag<uint32_t> d;
   const hn::Rebind<T, decltype(d)> dt;
-  const auto w = hn::Set(d, weight), inv = hn::Set(d, 32768 - weight), round = hn::Set(d, 16384);
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T);
   const auto blend = [&](auto av, auto bv) HWY_ATTR {
+    const auto w = hn::Set(d, weight), inv = hn::Set(d, 32768 - weight), round = hn::Set(d, 16384);
     return hn::DemoteTo(dt, hn::ShiftRight<15>(hn::Add(
                                 hn::Add(hn::Mul(hn::PromoteTo(d, av), inv), hn::Mul(hn::PromoteTo(d, bv), w)), round)));
   };
@@ -120,11 +122,12 @@ int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
   const int bits = sizeof(T) == 1 ? 8 : c->format.bits;
   const uint32_t maximum = (1u << bits) - 1;
-  const auto max = hn::Set(d, static_cast<Acc>(maximum)), half = hn::Set(d, static_cast<Acc>(maximum / 2));
-  const auto level = hn::Set(d, static_cast<Acc>(std::floor(c->opacity * maximum + .5)));
+  const Acc level_value = static_cast<Acc>(std::floor(c->opacity * maximum + .5));
   const bool contiguous =
       a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T) && (!masked || mask->step == sizeof(T));
   const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
+    const auto max = hn::Set(d, static_cast<Acc>(maximum)), half = hn::Set(d, static_cast<Acc>(maximum / 2));
+    const auto level = hn::Set(d, level_value);
     const auto av = hn::PromoteTo(d, ac);
     auto bv = hn::PromoteTo(d, bc), weight = level;
     if constexpr (masked) {
@@ -211,12 +214,13 @@ int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane 
   const hn::Rebind<int32_t, decltype(d)> di;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const auto max = hn::Set(d, maximum(c->format)), zero = hn::Zero(d), half = hn::Set(d, .5);
-  const auto opacity = hn::Set(d, c->opacity), neutral = hn::Set(d, c->neutral);
+  const double maximum_value = maximum(c->format), opacity_value = c->opacity, neutral_value = c->neutral;
   const auto promote = [&](auto v) HWY_ATTR {
     return hn::PromoteTo(d, hn::ConvertTo(df, hn::PromoteTo(du, v)));
   };
   const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
+    const auto max = hn::Set(d, maximum_value), zero = hn::Zero(d), half = hn::Set(d, .5);
+    const auto opacity = hn::Set(d, opacity_value), neutral = hn::Set(d, neutral_value);
     const auto av = promote(ac), bv = promote(bc);
     const auto w = masked ? hn::Mul(opacity, hn::Div(promote(mc), max)) : opacity;
     auto target = bv;
@@ -262,9 +266,10 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, c->opacity);
-  const auto neutral = hn::Set(d, c->neutral);
+  const double opacity_value = c->opacity, neutral_value = c->neutral;
   const auto blend = [&](auto af, auto bf, auto mf) HWY_ATTR {
+    const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, opacity_value);
+    const auto neutral = hn::Set(d, neutral_value);
     const auto av = hn::PromoteTo(d, af), bv = hn::PromoteTo(d, bf);
     const auto w = masked ? hn::Mul(opacity, hn::PromoteTo(d, mf)) : opacity;
     auto target = bv;
@@ -317,6 +322,7 @@ int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cons
   const auto neutral = hn::Set(d, c->neutral), opacity = hn::Set(d, c->opacity);
   const auto opacity_code = hn::Set(d, std::floor(c->opacity * maximum + 0.5));
   const auto mix = [&](auto av, auto bv, auto w) HWY_ATTR {
+    const auto zero = hn::Zero(d), one = hn::Set(d, 1);
     return hn::IfThenElse(hn::Eq(w, zero), av,
                           hn::IfThenElse(hn::Eq(w, one), bv, hn::Add(av, hn::Mul(hn::Sub(bv, av), w))));
   };
@@ -498,9 +504,9 @@ void CompatRows(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_
   const hn::Rebind<T, decltype(d)> dt;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
   const Acc scale = static_cast<Acc>(1u << f.bits);
-  const auto vs = hn::Set(d, scale), vo = hn::Set(d, static_cast<Acc>(opacity));
   const bool contiguous =
       a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T) && (!mask || mask->step == sizeof(T));
+  const auto vs = hn::Set(d, scale), vo = hn::Set(d, static_cast<Acc>(opacity));
   const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
     const auto av = hn::PromoteTo(d, ac), bv = hn::PromoteTo(d, bc);
     auto result = hn::Zero(d);
