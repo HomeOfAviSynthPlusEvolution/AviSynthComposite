@@ -83,7 +83,7 @@ when `inversion_sum` is integral and in [0,65535], also with at most 1 LSB error
 Masked integer continuous MIX and INVERT_MIX (`inversion_sum == maximum`)
 may similarly quantize their combined effective weight to Q16 within 1 LSB;
 noncanonical narrow-U16 inputs retain scalar evaluation. Exact zero-weight and
-full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for non-dyadic opacity, as
+full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for interior opacity, as
 described below. These allowances do not extend to other operations (except additional integer operations documented below), code weights,
 or F32. Repeated
 operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
@@ -236,10 +236,11 @@ contributors; Overlay was originally written by Klaus Post (2003–2004). This
 implementation also draws on the subsequent AviSynth+ contributors' fixes and
 semantic clarifications. No upstream golden source is distributed in this tree.
 
-Integer YUV Overlay Multiply may use binary32 SIMD for non-dyadic opacity
-(weights not exactly k/256). For canonical input codes, the final output differs
+Integer YUV Overlay Multiply may use binary32 SIMD for interior opacity
+(0 < opacity < 1). For canonical input codes, the final output differs
 from the scalar reference by at most 1 LSB. Zero and full opacity retain their
-existing exact behavior; floating-point formats are unchanged.
+existing exact behavior; floating-point formats are unchanged. Noncanonical
+narrow-U16 vectors retain scalar reference arithmetic.
 
 Integer continuous PRODUCT may quantize its blend weight to Q16, with at most
 1 LSB output difference. The product is still floored before blending.

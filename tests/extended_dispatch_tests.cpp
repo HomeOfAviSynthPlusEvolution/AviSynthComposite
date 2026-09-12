@@ -128,7 +128,7 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
     for (double opacity : {0.0, .003, .17, .5, .63, 1.0})
       for (bool masked : {false, true}) {
         cp_yuv_config c = {f, mode, opacity};
-        const int tolerance = bits != 32 && mode == CP_YUV_MULTIPLY && opacity * 256 != std::floor(opacity * 256) ? 1 : 0;
+        const int tolerance = bits != 32 && mode == CP_YUV_MULTIPLY && opacity > 0 && opacity < 1 ? 1 : 0;
         const cp_yuv gv = {got[0].out(), got[1].out(), got[2].out()}, rv = {ref[0].out(), ref[1].out(), ref[2].out()};
         const int expected = bits == 32 && mode > CP_YUV_SUBTRACT && mode != CP_YUV_MULTIPLY ? CP_UNSUPPORTED : CP_OK;
         CHECK(k->process_yuv(&c, av, bv, masked ? &mv : nullptr, gv, band) == expected);
@@ -521,7 +521,7 @@ void MultiplyRounding(const cp_kernels* k, int bits) {
         const auto mv = mask.in(), gv = guide.in();
         CHECK(cp_process_plane(&plane, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, ref.out(), a.rows()) ==
               CP_OK);
-        same(channel == 0 ? got : channel == 1 ? u : v, ref, "multiply rounding boundary", opacity * 256 != std::floor(opacity * 256) ? 1 : 0);
+        same(channel == 0 ? got : channel == 1 ? u : v, ref, "multiply rounding boundary", opacity > 0 && opacity < 1 ? 1 : 0);
       }
     }
   }
@@ -706,6 +706,40 @@ void IntegerYuvEdges(const cp_kernels* k, int bits) {
   }
 }
 
+static void MultiplyNoncanonical(const cp_kernels* k) {
+  for (int bits = 9; bits < 16; ++bits)
+    for (int step : {1, 4}) {
+      Image<uint16_t> a(67, 2, step, true), g = a, m = a, got = a, ref = a;
+      a.populate(bits, 12); g.populate(bits, 13); m.populate(bits, 14);
+      for (size_t i = 0; i < a.data.size(); ++i) {
+        if (i % 3 == 0) a.data[i] = 65535;
+        if (i % 5 == 0) g.data[i] = 65535;
+        if (i % 7 == 0) m.data[i] = 65535;
+      }
+      for (double opacity : {.17, .625})
+        for (bool masked : {false, true}) {
+          got = ref = a;
+          auto gu = a, gv = a, ru = a, rv = a;
+          const cp_yuv_config c{format(bits), CP_YUV_MULTIPLY, opacity};
+          const cp_const_yuv mm{m.in(), m.in(), m.in()}, gg{g.in(), g.in(), g.in()};
+          CHECK(k->process_yuv(&c, {got.in(), gu.in(), gv.in()}, gg, masked ? &mm : nullptr,
+                              {got.out(), gu.out(), gv.out()}, a.rows()) == CP_OK);
+          CHECK(cp_process_yuv(&c, {ref.in(), ru.in(), rv.in()}, gg, masked ? &mm : nullptr,
+                              {ref.out(), ru.out(), rv.out()}, a.rows()) == CP_OK);
+          same(got, ref, "noncanonical multiply Y", 1);
+          same(gu, ru, "noncanonical multiply U", 1);
+          same(gv, rv, "noncanonical multiply V", 1);
+          for (int y = 0; y < a.h; ++y) for (int x = 0; x < a.w; ++x) {
+            const int i = a.origin + y * a.pitch + x * a.step;
+            if (a.data[i] > (1u << bits) - 1 || g.data[i] > (1u << bits) - 1 ||
+                (masked && m.data[i] > (1u << bits) - 1)) {
+              CHECK(got.data[i] == ref.data[i]); CHECK(gu.data[i] == ru.data[i]); CHECK(gv.data[i] == rv.data[i]);
+            }
+          }
+        }
+    }
+}
+
 int main() {
   std::vector<int64_t> targets = {0};
   for (int64_t remaining = cp_supported_targets(); remaining; remaining &= remaining - 1)
@@ -713,6 +747,7 @@ int main() {
   for (auto target : targets) {
     const auto* k = cp_get_kernels(target);
     CHECK(k && k->process_yuv && k->resample_mask && k->affine && k->clamp && k->rgb_luma && k->color_key);
+    MultiplyNoncanonical(k);
     std::printf("extended target 0x%llx\n", static_cast<unsigned long long>(target));
     std::fflush(stdout);
     for (int width : {1, 3, 7, 16, 31, 65, 129})

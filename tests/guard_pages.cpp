@@ -222,6 +222,18 @@ void packed_yuv(const cp_kernels* k, int bits, int width, bool negative, bool re
                            {width, 2, 0, 2}) == CP_OK);
       CHECK(k->process_yuv(&config, input(out.data), src, masked ? &masks : nullptr, output(out.data),
                            {width, 2, 0, 2}) == CP_OK);
+      if (bits != 32 && op == CP_YUV_MULTIPLY) {
+        for (int i = 0; i < width * 2; ++i)
+          for (int p = 0; p < 3; ++p) {
+            const size_t offset = (size_t(i) * 4 + p) * sizeof(T);
+            T actual, expected;
+            std::memcpy(&actual, out.data + offset, sizeof(T));
+            std::memcpy(&expected, ref.data() + offset, sizeof(T));
+            CHECK(std::abs(int(actual) - int(expected)) <= 1);
+            std::memcpy(ref.data() + offset, &actual, sizeof(T));
+          }
+      }
+      // All gaps/canaries still compare byte-for-byte.
       CHECK(std::memcmp(ref.data(), out.data, span) == 0);
     }
   }
