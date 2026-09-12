@@ -784,23 +784,36 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
   return cp_process_plane(c, a, b, mask, ga, gb, output, r);
 #endif
 }
-template <class T>
+template <class T, int mask_mode = -1, int fixed_bits = 0>
 void CompatRows(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output, cp_rows r,
                 int opacity) {
+  if constexpr (mask_mode < 0) {
+    if (mask)
+      return CompatRows<T, 1>(f, a, b, mask, output, r, opacity);
+    return CompatRows<T, 0>(f, a, b, mask, output, r, opacity);
+  }
+  if constexpr (sizeof(T) == 2 && fixed_bits == 0) {
+    if (f.bits == 10)
+      return CompatRows<T, mask_mode, 10>(f, a, b, mask, output, r, opacity);
+    if (f.bits == 16)
+      return CompatRows<T, mask_mode, 16>(f, a, b, mask, output, r, opacity);
+  }
+  const int bits = sizeof(T) == 1 ? 8 : fixed_bits ? fixed_bits : f.bits;
+  constexpr bool masked = mask_mode != 0;
   // An 8-bit weighted sum, including rounding, is at most 65408.
   // Narrow accumulators therefore double the number of exact byte results.
   using Acc = std::conditional_t<std::is_same<T, uint8_t>::value, uint16_t, uint32_t>;
   const hn::ScalableTag<Acc> d;
   const hn::Rebind<T, decltype(d)> dt;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
-  const Acc scale = static_cast<Acc>(1u << f.bits);
+  const Acc scale = static_cast<Acc>(1u << bits);
   const bool contiguous =
-      a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T) && (!mask || mask->step == sizeof(T));
+      a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T) && (!masked || mask->step == sizeof(T));
   const auto vs = hn::Set(d, scale), vo = hn::Set(d, static_cast<Acc>(opacity));
   const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
     const auto av = hn::PromoteTo(d, ac), bv = hn::PromoteTo(d, bc);
     auto result = hn::Zero(d);
-    if (!mask) {
+    if constexpr (!masked) {
       result = hn::ShiftRight<8>(
           hn::Add(hn::Add(hn::Mul(av, hn::Set(d, static_cast<Acc>(256 - opacity))), hn::Mul(bv, vo)), hn::Set(d, 128)));
     } else {
@@ -808,7 +821,7 @@ void CompatRows(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_
       const auto weight = opacity == 256 ? mv : hn::ShiftRight<8>(hn::Mul(mv, vo));
       // The 16-bit maximum is 65535*65536+32768, which fits uint32_t.
       result = hn::ShiftRightSame(
-          hn::Add(hn::Add(hn::Mul(av, hn::Sub(vs, weight)), hn::Mul(bv, weight)), hn::Set(d, scale / 2)), f.bits);
+          hn::Add(hn::Add(hn::Mul(av, hn::Sub(vs, weight)), hn::Mul(bv, weight)), hn::Set(d, scale / 2)), bits);
       if (opacity == 256)
         result = hn::IfThenElse(hn::Eq(mv, hn::Set(d, scale - 1)), bv, result);
     }
@@ -819,17 +832,21 @@ void CompatRows(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_
     if (contiguous) {
       const auto* ap = reinterpret_cast<const T*>(address(a, 0, y));
       const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
-      const auto* mp = mask ? reinterpret_cast<const T*>(address(*mask, 0, y)) : nullptr;
+      const auto* mp = masked ? reinterpret_cast<const T*>(address(*mask, 0, y)) : nullptr;
       auto* dst = reinterpret_cast<T*>(address(output, 0, y));
       for (; x < end; x += n)
-        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), mask ? hn::LoadU(dt, mp + x) : hn::Zero(dt)), dt,
+        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Zero(dt)), dt,
                    dst + x);
     }
+    for (; x + n <= width; x += n)
+      StoreChannel(blend(LoadChannel(dt, a, int(x), y, n), LoadChannel(dt, b, int(x), y, n),
+                         masked ? LoadChannel(dt, *mask, int(x), y, n) : hn::Zero(dt)),
+                   dt, output, int(x), y, n);
     for (; x < width; x += n) {
       const size_t count = std::min(n, width - x);
       StoreChannel(blend(LoadChannel(dt, a, static_cast<int>(x), y, count),
                          LoadChannel(dt, b, static_cast<int>(x), y, count),
-                         mask ? LoadChannel(dt, *mask, static_cast<int>(x), y, count) : hn::Zero(dt)),
+                         masked ? LoadChannel(dt, *mask, static_cast<int>(x), y, count) : hn::Zero(dt)),
                    dt, output, static_cast<int>(x), y, count);
     }
   }
@@ -852,10 +869,6 @@ int Compat(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_plane
       return AverageRows<uint8_t>(a, b, output, r);
     return AverageRows<uint16_t>(a, b, output, r);
   }
-  // Smaller byte batches avoid the wide staging buffers on stepped channels.
-  // Scaling both weights and the rounding term by 128 preserves /256 rounding.
-  if (f.storage == CP_U8 && !mask && (a.step != 1 || b.step != 1 || output.step != 1))
-    return WeightedRows<uint8_t>(a, b, output, r, static_cast<uint32_t>(opacity) * 128);
   if (f.storage == CP_U8)
     CompatRows<uint8_t>(f, a, b, mask, output, r, opacity);
   else
