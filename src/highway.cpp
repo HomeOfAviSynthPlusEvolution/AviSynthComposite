@@ -84,7 +84,7 @@ hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
 // No opacity quantization occurs.
 template <class T, int operation = CP_MIX>
 int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
-                 uint32_t maximum_code = std::numeric_limits<T>::max()) {
+                 uint32_t maximum_code = std::numeric_limits<T>::max(), uint32_t offset = 0) {
   const hn::ScalableTag<uint32_t> d;
   const hn::Rebind<T, decltype(d)> dt;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
@@ -95,7 +95,16 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
     auto target = hn::PromoteTo(d, bv);
     if constexpr (operation == CP_PRODUCT)
       target = DivideCode(d, hn::Mul(base, target), sizeof(T) * 8);
-    if constexpr (operation == CP_SUBTRACT) {
+    if constexpr (operation == CP_INVERT_MIX || operation == CP_DIFFERENCE) {
+      // For offset <= 65536, even Difference's largest positive numerator
+      // plus rounding is 65535*32768 + 65536*32768 + 16384 < 2^32.
+      // Clamp the unsigned subtraction before rounding to avoid underflow.
+      const auto positive = hn::Add(operation == CP_DIFFERENCE ? hn::ShiftLeft<15>(base) : hn::Mul(base, inv),
+                                    hn::Mul(hn::Set(d, offset), w));
+      const auto negative = hn::Mul(target, w);
+      const auto value = hn::ShiftRight<15>(hn::Add(hn::Sub(hn::Max(positive, negative), negative), round));
+      return hn::DemoteTo(dt, hn::Min(value, hn::Set(d, maximum_code)));
+    } else if constexpr (operation == CP_SUBTRACT) {
       const hn::Rebind<int32_t, hn::ScalableTag<uint32_t>> di;
       // Both products are <= 65535*32768, so their signed difference and
       // rounding addition fit int32_t, even for noncanonical U16 samples.
@@ -436,6 +445,17 @@ int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cons
 int Copy(cp_format f, cp_const_plane source, cp_plane output, cp_rows r);
 int Compat(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output, cp_rows r,
            int opacity);
+// Keep offset kernels out of the already large Plane dispatcher so adding
+// specializations does not disrupt optimization of its existing stepped loops.
+HWY_NOINLINE int OffsetPlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cp_plane output,
+                                 cp_rows r, uint32_t weight, uint32_t offset) {
+  const auto max = static_cast<uint32_t>(maximum(c->format));
+  if (c->format.storage == CP_U8)
+    return c->operation == CP_INVERT_MIX ? WeightedRows<uint8_t, CP_INVERT_MIX>(a, b, output, r, weight, max, offset)
+                                         : WeightedRows<uint8_t, CP_DIFFERENCE>(a, b, output, r, weight, max, offset);
+  return c->operation == CP_INVERT_MIX ? WeightedRows<uint16_t, CP_INVERT_MIX>(a, b, output, r, weight, max, offset)
+                                       : WeightedRows<uint16_t, CP_DIFFERENCE>(a, b, output, r, weight, max, offset);
+}
 int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
           const cp_const_plane* ga, const cp_const_plane* gb, cp_plane output, cp_rows r) {
   const int status = check_plane(c, a, b, mask, ga, gb, output, r);
@@ -481,6 +501,14 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
                                     : WeightedRows<uint8_t, CP_SUBTRACT>(a, b, output, r, weight, max);
     return c->operation == CP_ADD ? WeightedRows<uint16_t, CP_ADD>(a, b, output, r, weight, max)
                                   : WeightedRows<uint16_t, CP_SUBTRACT>(a, b, output, r, weight, max);
+  }
+  if ((c->operation == CP_INVERT_MIX || c->operation == CP_DIFFERENCE) && !mask &&
+      c->weight_rule == CP_WEIGHT_CONTINUOUS && c->format.storage != CP_F32 && weight32768 == std::floor(weight32768)) {
+    const double offset = c->operation == CP_INVERT_MIX ? c->inversion_sum : c->bias;
+    // Include the 65536 chroma inversion sum while keeping all intermediate
+    // values bounded. Fractional or larger offsets retain binary64 evaluation.
+    if (offset >= 0 && offset <= 65536 && offset == std::floor(offset))
+      return OffsetPlaneRows(c, a, b, output, r, static_cast<uint32_t>(weight32768), static_cast<uint32_t>(offset));
   }
   // At full opacity, continuous and code mask weights are identical.
   if (c->format.storage != CP_F32 && (c->weight_rule == CP_WEIGHT_CODE || c->opacity == 1) &&

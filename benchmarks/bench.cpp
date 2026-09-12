@@ -79,6 +79,8 @@ void run(int bits, int step) {
   for (const std::string workload : {"continuous_product",
                                      "continuous_add",
                                      "continuous_subtract",
+                                     "continuous_invert",
+                                     "continuous_difference",
                                      "mix",
                                      "code_mix",
                                      "code_guided",
@@ -122,10 +124,14 @@ void run(int bits, int step) {
       c.operation =
           workload == "continuous_add"                                                               ? CP_ADD
           : workload == "continuous_subtract"                                                        ? CP_SUBTRACT
+          : workload == "continuous_invert"                                                          ? CP_INVERT_MIX
+          : workload == "continuous_difference"                                                      ? CP_DIFFERENCE
           : workload == "product" || workload == "continuous_product" || workload == "layer_mul_rgb" ? CP_PRODUCT
           : (workload == "guided" || workload == "code_guided" || workload == "overlay_mul") ? CP_GUIDED_MULTIPLY
                                                                                              : CP_MIX;
       c.opacity = blend_opacity;
+      c.inversion_sum = maximum;
+      c.bias = bits == 32 ? 0 : (maximum + 1) / 2;
       c.neutral = workload == "code_guided" ? (bits == 32 ? 0 : (maximum + 1) / 2) : maximum / 2;
       c.weight_rule = rgb || workload == "code_mix" || workload == "code_guided" || workload == "product"
                           ? CP_WEIGHT_CODE

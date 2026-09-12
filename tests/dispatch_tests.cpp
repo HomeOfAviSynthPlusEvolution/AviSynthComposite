@@ -262,6 +262,29 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
       check();
     }
   }
+  // Offset bounds cover negative intermediate targets, upper clipping, the
+  // chroma inversion sum 65536, and fractional/out-of-range fallback paths.
+  for (int operation : {CP_INVERT_MIX, CP_DIFFERENCE}) {
+    c.operation = operation;
+    for (double offset : {-1., 0., .5, double(1u << (bits - 1)), double((1u << bits) - 1), double(1u << bits), 65535.,
+                          65536., 65537.}) {
+      c.inversion_sum = c.bias = offset;
+      for (double opacity : {0., 1. / 32768, .5, .625, std::nextafter(.625, 1.), 32767. / 32768, 1.}) {
+        c.opacity = opacity;
+        check();
+      }
+    }
+    c.inversion_sum = c.bias = 65536;
+    c.opacity = .625;
+    check();
+    for (bool alias_base : {false, true}) {
+      got = alias_base ? a : b;
+      const cp_const_plane alias{got.data(), pitch, sizeof(T)};
+      CHECK(k->process_plane(&c, alias_base ? alias : pa, alias_base ? pb : alias, nullptr, nullptr, nullptr,
+                             {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
+      CHECK(got == expected);
+    }
+  }
 }
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
