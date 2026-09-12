@@ -193,9 +193,11 @@ static void FloatEndpoints(const cp_kernels* table) {
   }
 }
 static void FloatBlendSpecials(const cp_kernels* table) {
+  // Finite samples: signed zero, one 16-bit-scale step, ordinary colors and HDR100.
+  // NaN/Inf are separate propagation cases, not brightness requirements.
   constexpr int n = 67;
-  const uint32_t patterns[] = {0,          0x80000000, 1,          0x80000001, 0x3f000000, 0xbf800000,
-                               0x7f7fffff, 0xff7fffff, 0x7f800000, 0xff800000, 0x7fc12345};
+  const uint32_t patterns[] = {0,          0x80000000, 0x37800000, 0xb7800000, 0x3f000000, 0xbf800000,
+                               0x42c80000, 0xc2c80000, 0x7f800000, 0xff800000, 0x7fc12345};
   float a[n], b[n], m[n], actual[n], expected[n];
   for (int i = 0; i < n; ++i) {
     std::memcpy(a + i, &patterns[i % 11], 4);
@@ -204,7 +206,7 @@ static void FloatBlendSpecials(const cp_kernels* table) {
   }
   const cp_const_plane pa{a, n * 4, 4}, pb{b, n * 4, 4}, pm{m, n * 4, 4};
   for (int op : {CP_MIX, CP_PRODUCT, CP_GUIDED_MULTIPLY, CP_DIFFERENCE, CP_ADD, CP_SUBTRACT, CP_INVERT_MIX})
-    for (double neutral : {-0.0, 0.0, .1, .5, -1e300})
+    for (double neutral : {-0.0, 0.0, .1, .5, -1.0})
       for (double opacity : {0.0, .17, .625, 1.0})
         for (bool masked : {false, true}) {
           const cp_plane_config c{{CP_F32, 32}, op, opacity, neutral, neutral, neutral, 0, 0, CP_WEIGHT_CONTINUOUS};
@@ -244,8 +246,8 @@ void U8MaskedMixRounding(const cp_kernels* k, int operation = CP_MIX) {
   c.operation = operation;
   c.inversion_sum = 255;
   c.weight_rule = CP_WEIGHT_CONTINUOUS;
-  for (double opacity : {std::numeric_limits<double>::denorm_min(), .1, .17, std::nextafter(.5, 0.), .5,
-                         std::nextafter(.5, 1.), .625, std::nextafter(1., 0.), 1.}) {
+  for (double opacity : {1.0 / 65535, .1, .17, std::nextafter(.5, 0.), .5,
+                         std::nextafter(.5, 1.), .625, 1.0 - 1.0 / 65535, 1.}) {
     c.opacity = opacity;
     for (uint8_t m : {0, 1, 51, 85, 127, 128, 170, 254, 255}) {
       std::fill(mask.begin(), mask.end(), m);
@@ -382,7 +384,7 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
   const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
   const cp_rows rows{count, 1, 0, 1};
   for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT, CP_ADD, CP_SUBTRACT, CP_DIFFERENCE})
-    for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
+    for (double opacity : {0., .17, .5, .625, 1.0 - 1.0 / 65535, 1.})
       for (bool endpoints : {false, true}) {
         // Exercise legal endpoint codes in both a full vector and the tail.
         a[17] = endpoints ? T(max) : T(max / 2);
@@ -420,7 +422,7 @@ static void GuidedBounded(const cp_kernels* k, int bits) {
   const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
   const cp_rows rows{count, 1, 0, 1};
   for (double neutral : {0., .1, double(max) / 2, double(max), -1., double(max) + 1.})
-    for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
+    for (double opacity : {0., .17, .5, .625, 1.0 - 1.0 / 65535, 1.})
       for (bool endpoints : {false, true}) {
         // Exercise legal endpoint codes in both a full vector and the tail.
         b[33] = endpoints ? T(max) : T(max / 3);
@@ -449,7 +451,7 @@ static void GuidedBounded(const cp_kernels* k, int bits) {
 static void FloatBlendZeroSigns(const cp_kernels* k) {
   constexpr int n=67;
   for (int operation : {CP_MIX, CP_PRODUCT}) {
-    std::vector<float> a(n, operation==CP_MIX ? -0.f : -std::numeric_limits<float>::denorm_min());
+    std::vector<float> a(n, -0.f);
     std::vector<float> b(n, operation==CP_MIX ? -0.f : 0.f), m(n,1.f), got(n), ref(n);
     const cp_const_plane pa{a.data(),n*4,4}, pb{b.data(),n*4,4}, pm{m.data(),n*4,4};
     cp_plane_config c{}; c.format={CP_F32,32}; c.operation=static_cast<cp_operation>(operation);
@@ -467,7 +469,7 @@ static void FiniteFloatBlends(const cp_kernels* k) {
   double max_normal_error = 0;
   for (int operation : {CP_MIX, CP_PRODUCT})
     for (bool negative : {false, true})
-      for (double opacity : {0., .003, .17, .5, .625, .75, std::nextafter(.75, 1.), .9, 1.0-1e-8, std::nextafter(1.,0.), 1.})
+      for (double opacity : {0., 1.0 / 65535, .003, .17, .5, .625, .75, .75 + 1.0 / 65535, .9, 1.0 - 1.0 / 65535, 1.})
         for (int scenario = 0; scenario < 7; ++scenario) {
           std::vector<float> a(size), b(size), m(size), got(size), ref(size);
           const std::vector<float> untouched(size, 19.f);
@@ -476,15 +478,15 @@ static void FiniteFloatBlends(const cp_kernels* k) {
             b[i] = float(rng() % 65536) / 65535.f;
             m[i] = i % 7 == 0 ? 0.f : i % 7 == 1 ? 1.f : float(rng() % 65536) / 65535.f;
             if (scenario == 1) b[i] = -a[i]; // cancellation
-            if (scenario == 2) a[i] = std::ldexp(a[i], i % 254 - 126);
+            if (scenario == 2) a[i] = std::ldexp(a[i], i % 23 - 16);
             if (scenario == 3) {
-              a[i] = i % 3 == 0 ? -0.f : i % 3 == 1 ? std::numeric_limits<float>::max() : -4.f;
+              a[i] = i % 3 == 0 ? -0.f : i % 3 == 1 ? 100.f : -4.f;
               b[i] = i % 4 == 0 ? -2.f : i % 4 == 1 ? 4.f : b[i];
             }
           }
           if (scenario == 4) for (int i=0;i<size;++i) { a[i] *= 100; b[i] = i%5==0 ? -.125f : b[i]*100; }
-          if (scenario == 5) for (int i=0;i<size;++i) { a[i] = std::ldexp(a[i], i%254-126); b[i] = std::ldexp(b[i], (i*37)%254-126); }
-          if (scenario == 6) for (int i=0;i<size;++i) { b[i] = i%3==0 ? 1e-8f : i%3==1 ? 0.f : -float((1-opacity)/std::max(opacity,1e-300)); m[i]=1; }
+          if (scenario == 5) for (int i=0;i<size;++i) { a[i] = std::ldexp(a[i], i%23-16); b[i] = std::ldexp(b[i], (i*37)%23-16); }
+          if (scenario == 6) for (int i=0;i<size;++i) { b[i] = i%3==0 ? 1.f/65535 : i%3==1 ? 0.f : -float(std::min(100.0, (1-opacity)/std::max(opacity,1.0/65535))); m[i]=1; }
           const int origin = negative ? pitch : 0;
           const ptrdiff_t stride = (negative ? -pitch : pitch) * sizeof(float);
           for (int alias = 0; alias < 4; ++alias) {

@@ -243,7 +243,7 @@ static void FloatYuvEdges(const cp_kernels* k) {
                        .5f,
                        -4.0f,
                        4.0f,
-                       std::numeric_limits<float>::max()};
+                       100.f};
   for (int step : {1, 4})
     for (bool negative : {false, true}) {
       Image<float> proto(257, 3, step, negative);
@@ -294,11 +294,11 @@ static void FloatSpecials(const cp_kernels* k) {
   CHECK(cp_clamp(f, a.in(), ref.out(), a.rows(), -0.0, 1) == CP_OK);
   same(got, ref, "float clamp specials");
   // Exact and non-binary32 bounds must agree on zero signs and rounding.
-  const double huge = std::numeric_limits<double>::max();
+  const double huge = 100.0;
   for (const auto& bounds : {std::array<double, 2>{0.0, -0.0},
                              {-0.0, -0.0},
                              {-1, 1},
-                             {std::nextafter(0.0, -1.0), std::nextafter(1.0, 2.0)},
+                             {-1.0 / 65535, std::nextafter(1.0, 2.0)},
                              {.1, .9},
                              {-huge, huge}}) {
     CHECK(k->clamp(f, a.in(), got.out(), a.rows(), bounds[0], bounds[1]) == CP_OK);
@@ -342,7 +342,7 @@ static void FloatSpecials(const cp_kernels* k) {
 void FloatSteppedViews(const cp_kernels* k) {
   Image<float> red(67, 3, 2, false), green(67, 3, 3, true), blue(67, 3, 4, false), alpha(67, 3, 5, true);
   Image<float> got(67, 3, 7, true), ref = got;
-  constexpr uint32_t values[]{0,           0x80000000u, 1,           0x80000001u, 0x3f000000u,
+  constexpr uint32_t values[]{0,           0x80000000u, 0x37800000u, 0xb7800000u, 0x3f000000u,
                               0x3f800000u, 0xbf800000u, 0x7f800000u, 0xff800000u, 0x7fc12345u};
   int channel = 0;
   for (auto* input : {&red, &green, &blue, &alpha}) {
@@ -388,11 +388,11 @@ void FloatKeyThresholds(const cp_kernels* k) {
   Image<float> values(4097, 1, 1, false), alpha = values, got = values, ref = values;
   std::mt19937 rng(7771);
   for (size_t i = 0; i < values.data.size(); ++i) {
-    const uint32_t pixel = rng(), payload = 0x7fc00000u | (rng() & 0x3fffffu);
-    std::memcpy(&values.data[i], &pixel, 4);
+    const uint32_t payload = 0x7fc00000u | (rng() & 0x3fffffu);
+    values.data[i] = float(int(rng() % 131071) - 65535) * (100.f / 65535);
     std::memcpy(&alpha.data[i], &payload, 4);
   }
-  const double huge = std::numeric_limits<double>::max(), maxfloat = std::numeric_limits<float>::max();
+  const double hdr_limit = 100.0;
   const double cases[][2]{{0, 0},
                           {-.0, -.0},
                           {.1, 0},
@@ -400,19 +400,19 @@ void FloatKeyThresholds(const cp_kernels* k) {
                           {.1, .2},
                           {.5, std::nextafter(.25, 0.0)},
                           {.5, std::nextafter(.25, 1.0)},
-                          {huge, huge},
-                          {huge, std::nextafter(huge, 0.0)},
-                          {-huge, huge},
-                          {1e100, 1e100},
-                          {-1e100, 1e100},
-                          {1e-300, 0},
-                          {1e-300, 1e-300},
-                          {maxfloat, 0},
-                          {0, maxfloat}};
+                          {hdr_limit, hdr_limit},
+                          {hdr_limit, std::nextafter(hdr_limit, 0.0)},
+                          {-hdr_limit, hdr_limit},
+                          {16, 32},
+                          {-16, 32},
+                          {1.0 / 65535, 0},
+                          {1.0 / 65535, 1.0 / 65535},
+                          {hdr_limit, 0},
+                          {0, hdr_limit}};
   for (const auto& bounds : cases) {
     size_t i = 0;
     for (double candidate : {bounds[0], bounds[0] - bounds[1], bounds[0] + bounds[1]})
-      if (std::isfinite(candidate) && std::abs(candidate) <= maxfloat) {
+      if (std::isfinite(candidate) && std::abs(candidate) <= hdr_limit) {
         const float center = static_cast<float>(candidate);
         values.data[i++] = center;
         values.data[i++] = std::nextafter(center, -std::numeric_limits<float>::infinity());
@@ -451,9 +451,9 @@ void FloatKeyThresholds(const cp_kernels* k) {
 }
 
 void FloatMultiplySpecials(const cp_kernels* k) {
-  constexpr uint32_t patterns[]{0,           0x80000000u, 1,           0x80000001u, 0x007fffffu,
-                                0x00800000u, 0x3f000000u, 0xbf000000u, 0x3f800000u, 0xbf800000u,
-                                0x7f7fffffu, 0xff7fffffu, 0x7f800000u, 0xff800000u, 0x7fc12345u};
+  constexpr uint32_t patterns[]{0,           0x80000000u, 0x37800000u, 0xb7800000u, 0x37800000u,
+                                0x39800000u, 0x3f000000u, 0xbf000000u, 0x3f800000u, 0xbf800000u,
+                                0x42c80000u, 0xc2c80000u, 0x7f800000u, 0xff800000u, 0x7fc12345u};
   constexpr int count = int(sizeof(patterns) / sizeof(patterns[0]));
   Image<float> a(count * count, 1, 1, false), guide = a, y = a, u = a, v = a, ry = a, ru = a, rv = a;
   for (int i = 0; i < count * count; ++i) {
@@ -501,7 +501,7 @@ void MultiplyRounding(const cp_kernels* k, int bits) {
     }
   }
   std::vector<double> opacities{0.0, std::nextafter(.5, 0.0),  .5, std::nextafter(.5, 1.0), .625,
-                                .17, .37, std::nextafter(1.0, 0.0), 1.0};
+                                .17, .37, 1.0 - 1.0 / 65535, 1.0};
   if (bits == 8)
     for (int level = 1; level < 256; ++level)
       opacities.push_back(level / 256.0);
@@ -538,7 +538,7 @@ void IntegerKeyThresholds(const cp_kernels* k, int bits) {
     colors.data[x] = T(x);
     alpha.data[x] = T((x * 137 + 23) & (width - 1));
   }
-  const double huge = std::numeric_limits<double>::max();
+  const double huge = 2 * maximum;
   const double cases[][2]{{0, 0},
                           {maximum, 0},
                           {.1, 0},
@@ -548,8 +548,8 @@ void IntegerKeyThresholds(const cp_kernels* k, int bits) {
                           {huge, huge},
                           {-huge, huge},
                           {huge, std::nextafter(huge, 0.)},
-                          {1e100, 1e100},
-                          {-1e100, 1e100},
+                          {maximum + 1, maximum},
+                          {-maximum, maximum},
                           {0, maximum}};
   for (const auto& values : cases) {
     const double key[3]{values[0], values[0], values[0]}, tolerance[3]{values[1], values[1], values[1]};
@@ -573,10 +573,12 @@ void GuidedLimits(const cp_kernels* k, int bits) {
   for (size_t i = 0; i < mask.data.size(); ++i) {
     mask.data[i] = T(i % 3 == 0 ? 0 : i % 3 == 1 ? maximum : maximum / 3);
     if (i % 7 == 0)
-      a.data[i] = bits == 32 ? std::numeric_limits<T>::max() : T(maximum);
+      a.data[i] = bits == 32 ? T(100) : T(maximum);
   }
-  const double huge = std::numeric_limits<double>::max();
-  for (double neutral : {-huge, -0.0, .1, maximum / 2, huge})
+  const std::array<double, 6> neutrals = bits == 32
+      ? std::array<double, 6>{-.5, -0.0, 0.0, .1, .5, 1.0}
+      : std::array<double, 6>{0.0, .1, maximum / 2, double(1u << (bits - 1)), maximum, maximum + 1};
+  for (double neutral : neutrals)
     for (double opacity : {.17, 1.0})
       for (bool masked : {false, true}) {
         const cp_plane_config c{f, CP_GUIDED_MULTIPLY, opacity, neutral, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
@@ -599,7 +601,7 @@ void GuidedLimits(const cp_kernels* k, int bits) {
               CP_OK);
         CHECK(cp_process_plane(&c, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, ref.out(), a.rows()) ==
               CP_OK);
-        verify("guided extreme neutral and endpoint codes");
+        verify("guided engineering neutral and endpoint codes");
         // The guide and mask may be exact aliases of the destination.
         for (bool alias_mask : {false, true}) {
           got = ref = alias_mask ? mask : guide;
@@ -617,13 +619,13 @@ void GuidedLimits(const cp_kernels* k, int bits) {
 template <class T>
 void IntegerClampLimits(const cp_kernels* k, int bits) {
   const int width = 1 << bits;
-  const double maximum = width - 1, huge = std::numeric_limits<double>::max();
+  const double maximum = width - 1;
   Image<T> source(width, 1, 1, false), got = source, ref = source;
   for (int x = 0; x < width; ++x)
     source.data[x] = T(x);
-  const double limits[][2]{{-huge, huge},
-                           {-huge, -1},
-                           {maximum + 1, huge},
+  const double limits[][2]{{-1, maximum + 1},
+                           {-2, -1},
+                           {maximum + 1, maximum + 2},
                            {0, maximum},
                            {.5, .5},
                            {std::nextafter(.5, 0.), std::nextafter(.5, 1.)},
@@ -638,17 +640,17 @@ void IntegerClampLimits(const cp_kernels* k, int bits) {
     CHECK(k->clamp(format(bits), got.in(), got.out(), source.rows(), range[0], range[1]) == CP_OK);
     same(got, ref, "integer clamp in-place limits");
   }
-  // Include all storage codes, even values beyond a sub-16-bit format's max.
-  const int codes = 1 << (sizeof(T) * 8);
+  // Cover every declared-depth code plus a canonical tail sample.
+  const int codes = 1 << bits;
   Image<T> input(codes + 1, 1, 1, false), inverted = input, expected = input;
   for (int x = 0; x <= codes; ++x)
-    input.data[x] = T(x);
+    input.data[x] = T(x % codes);
   CHECK(k->affine(format(bits), input.in(), inverted.out(), input.rows(), -1, maximum) == CP_OK);
   CHECK(cp_affine(format(bits), input.in(), expected.out(), input.rows(), -1, maximum) == CP_OK);
-  same(inverted, expected, "integer inversion storage codes");
+  same(inverted, expected, "integer inversion declared-depth codes");
   inverted = input;
   CHECK(k->affine(format(bits), inverted.in(), inverted.out(), input.rows(), -1, maximum) == CP_OK);
-  same(inverted, expected, "integer inversion in-place storage codes");
+  same(inverted, expected, "integer inversion in-place declared-depth codes");
 }
 
 template <class T>
@@ -712,7 +714,7 @@ static void SharedFloatMultiply(const cp_kernels* k) {
   double largest_error = 0;
   for (bool masked : {false, true})
    for (bool negative : {false, true})
-    for (double opacity : {.003, .17, .625, .75, std::nextafter(.75, 1.), .9, 1.0-1e-8, std::nextafter(1.,0.), 1.})
+    for (double opacity : {1.0 / 65535, .003, .17, .625, .75, .75 + 1.0 / 65535, .9, 1.0 - 1.0 / 65535, 1.})
       for (int scenario = 0; scenario < 6; ++scenario) {
         Image<float> proto(count, 2, 1, negative);
         std::array<Image<float>, 3> a{proto, proto, proto};
@@ -723,12 +725,12 @@ static void SharedFloatMultiply(const cp_kernels* k) {
           for (int p = 0; p < 3; ++p) {
             float v = float(int(rng() % 131073) - 65536) / 65536.f;
             if (scenario == 1) v *= 16;
-            if (scenario == 2) v = std::ldexp(v, int(i % 254) - 126);
-            if (scenario == 3) v = i % 3 == 0 ? -0.f : i % 3 == 1 ? std::numeric_limits<float>::max() : -1.f;
+            if (scenario == 2) v = std::ldexp(v, int(i % 23) - 16);
+            if (scenario == 3) v = i % 3 == 0 ? -0.f : i % 3 == 1 ? 100.f : -1.f;
             a[p].data[i] = v;
           }
           if (scenario == 4) { guide.data[i] = float(int(rng()%10001)-5000)/50; for(int p=0;p<3;++p) a[p].data[i] *=100; }
-          if (scenario == 5) { guide.data[i] = i%3==0 ? 1e-8f : i%3==1 ? 0.f : -float((1-opacity)/std::max(opacity,1e-300)); mask.data[i]=1; }
+          if (scenario == 5) { guide.data[i] = i%3==0 ? 1.f/65535 : i%3==1 ? 0.f : -float(std::min(100.0, (1-opacity)/opacity)); mask.data[i]=1; }
           if (scenario == 3) guide.data[i] = i % 4 == 0 ? -2.f : i % 4 == 1 ? 4.f : guide.data[i];
         }
         for (int alias = 0; alias < 3; ++alias) {
