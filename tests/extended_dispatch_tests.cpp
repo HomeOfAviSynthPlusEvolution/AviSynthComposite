@@ -214,6 +214,64 @@ void Sampling(const cp_kernels* k, int bits, int width, int step, bool negative)
   CHECK(k->resample_mask(f, source.in(), got.out(), &s, got.rows()) == CP_INVALID_ARGUMENT);
   same(got, before, "invalid sampling");
 }
+static void FloatYuvEdges(const cp_kernels* k) {
+  // Include neighbors of both luma transitions, signed zeros and finite HDR
+  // values. Width 257 covers full vectors, tails and stepped staging tiles.
+  const float over = 32.0f / 255;
+  const float values[]{-0.0f,
+                       0.0f,
+                       -over,
+                       std::nextafter(-over, 0.0f),
+                       std::nextafter(-over, -1.0f),
+                       1.0f,
+                       std::nextafter(1.0f, 0.0f),
+                       std::nextafter(1.0f, 2.0f),
+                       1 + over,
+                       std::nextafter(1 + over, 1.0f),
+                       std::nextafter(1 + over, 2.0f),
+                       -.5f,
+                       .5f,
+                       -4.0f,
+                       4.0f,
+                       std::numeric_limits<float>::max()};
+  for (int step : {1, 4})
+    for (bool negative : {false, true}) {
+      Image<float> proto(257, 3, step, negative);
+      std::array<Image<float>, 3> a{proto, proto, proto}, b = a, m = a;
+      for (int p = 0; p < 3; ++p)
+        for (int y = 0; y < 3; ++y)
+          for (int x = 0; x < 257; ++x) {
+            const int i = proto.origin + y * proto.pitch + x * step;
+            a[p].data[i] = values[(x + p + y) % 16];
+            b[p].data[i] = values[(x / 16 + p + y) % 16];
+            m[p].data[i] = x % 5 == 0 ? 0.0f : float((x + p) % 7) / 6;
+          }
+      const cp_const_yuv av{a[0].in(), a[1].in(), a[2].in()}, bv{b[0].in(), b[1].in(), b[2].in()},
+          mv{m[0].in(), m[1].in(), m[2].in()};
+      const cp_rows band{257, 3, 1, 1};
+      for (int op : {CP_YUV_ADD, CP_YUV_SUBTRACT})
+        for (double opacity : {0.0, .003, .5, .63, 1.0})
+          for (bool masked : {false, true}) {
+            const cp_yuv_config c{format(32), op, opacity};
+            auto got = b, ref = b;
+            const cp_const_yuv gs{got[0].in(), got[1].in(), got[2].in()}, rs{ref[0].in(), ref[1].in(), ref[2].in()};
+            CHECK(k->process_yuv(&c, av, gs, masked ? &mv : nullptr, {got[0].out(), got[1].out(), got[2].out()},
+                                 band) == CP_OK);
+            CHECK(cp_process_yuv(&c, av, rs, masked ? &mv : nullptr, {ref[0].out(), ref[1].out(), ref[2].out()},
+                                 band) == CP_OK);
+            for (int p = 0; p < 3; ++p)
+              same(got[p], ref[p], "float YUV edges and source in-place");
+            got = m;
+            ref = m;
+            const cp_const_yuv gm{got[0].in(), got[1].in(), got[2].in()}, rm{ref[0].in(), ref[1].in(), ref[2].in()};
+            CHECK(k->process_yuv(&c, av, bv, &gm, {got[0].out(), got[1].out(), got[2].out()}, band) == CP_OK);
+            CHECK(cp_process_yuv(&c, av, bv, &rm, {ref[0].out(), ref[1].out(), ref[2].out()}, band) == CP_OK);
+            for (int p = 0; p < 3; ++p)
+              same(got[p], ref[p], "float YUV mask in-place");
+          }
+    }
+}
+
 static void FloatSpecials(const cp_kernels* k) {
   Image<float> a(65, 1, 1, false, 0), alpha = a, got = a, ref = a;
   const uint32_t values[] = {0x80000000, 0, 0x7fc12345, 0xff800000, 0x7f800000, 0x3f800000};
@@ -609,6 +667,7 @@ int main() {
     FloatKeyThresholds(k);
     FloatSteppedViews(k);
     FloatMultiplySpecials(k);
+    FloatYuvEdges(k);
     FloatSpecials(k);
   }
   std::thread a([] { Sampling<float>(cp_get_kernels(0), 32, 129, 4, true); });

@@ -591,10 +591,15 @@ static void concurrent_bands() {
   std::vector<uint16_t> a(1000, 100), b(1000, 500), d(1000, 0);
   const auto c = config(10, CP_MIX, 0.25);
   std::vector<std::future<int>> jobs;
-  for (int i = 0; i < 10; ++i)
+  for (int i = 0; i < 4; ++i)
     jobs.push_back(std::async(std::launch::async, [&, i] {
-      return cp_process_plane(&c, in(a.data(), 100), in(b.data(), 100), nullptr, nullptr, nullptr, out(d.data(), 100),
-                              {100, 10, i, 1});
+      for (int row = i; row < 10; row += 4) {
+        const int status = cp_process_plane(&c, in(a.data(), 100), in(b.data(), 100), nullptr, nullptr, nullptr,
+                                            out(d.data(), 100), {100, 10, row, 1});
+        if (status != CP_OK)
+          return status;
+      }
+      return int(CP_OK);
     }));
   for (auto& j : jobs)
     CHECK(j.get() == CP_OK);

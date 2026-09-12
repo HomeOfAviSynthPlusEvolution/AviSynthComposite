@@ -117,6 +117,30 @@ void run(const cp_kernels* k, int bits, int width, int step, bool negative) {
         for (size_t gap = sizeof(T); gap < size_t(step) * sizeof(T); ++gap)
           CHECK(p[y * stride + size_t(x) * step * sizeof(T) + gap] == 0xCD);
 }
+// Full interior box rows end exactly at a guard page, including SIMD tails.
+template <class T>
+void box_sampling(const cp_kernels* k, int bits, int width, bool negative) {
+  const size_t row_bytes = size_t(width) * 2 * sizeof(T);
+  Guarded source(row_bytes * 2, !negative), out(size_t(width) * sizeof(T));
+  const T maximum = bits == 32 ? T(1) : T((1u << bits) - 1);
+  for (int i = 0; i < width * 4; ++i) {
+    const T value = i % 5 == 0 ? maximum : T(i % 7);
+    std::memcpy(source.data + size_t(i) * sizeof(T), &value, sizeof(T));
+  }
+  const cp_const_plane input{source.data + (negative ? row_bytes : 0),
+                             negative ? -ptrdiff_t(row_bytes) : ptrdiff_t(row_bytes), sizeof(T)};
+  const cp_plane output{out.data, ptrdiff_t(out.size), sizeof(T)};
+  std::vector<T> reference(width);
+  const cp_plane expected{reference.data(), ptrdiff_t(out.size), sizeof(T)};
+  const cp_format f{bits == 32 ? CP_F32 : bits == 8 ? CP_U8 : CP_U16, bits};
+  for (int vertical : {1, 2}) {
+    const cp_sampling sampling{width * 2, 2, 2, vertical, CP_CENTER, 0, 0};
+    CHECK(k->resample_mask(f, input, output, &sampling, {width, 1, 0, 1}) == CP_OK);
+    CHECK(cp_resample_mask(f, input, expected, &sampling, {width, 1, 0, 1}) == CP_OK);
+    CHECK(std::memcmp(out.data, reference.data(), out.size) == 0);
+  }
+}
+
 template <class T>
 void packed_key(const cp_kernels* k, int bits, int width, bool negative, bool bgra) {
   constexpr size_t bytes = sizeof(T), pixel_bytes = 4 * bytes;
@@ -193,6 +217,14 @@ int main() {
   std::vector<int64_t> targets = {0};
   for (int64_t rest = cp_supported_targets(); rest; rest &= rest - 1)
     targets.push_back(rest & -rest);
+  for (auto target : targets)
+    for (int width : {1, 3, 7, 15, 16, 17, 31, 32, 33, 65, 127})
+      for (bool negative : {false, true}) {
+        box_sampling<uint8_t>(cp_get_kernels(target), 8, width, negative);
+        for (int bits = 9; bits <= 16; ++bits)
+          box_sampling<uint16_t>(cp_get_kernels(target), bits, width, negative);
+        box_sampling<float>(cp_get_kernels(target), 32, width, negative);
+      }
   for (auto target : targets)
     for (int width : {1, 3, 7, 15, 16, 17, 31, 32, 33, 65})
       for (int step : {1, 2, 3, 4})

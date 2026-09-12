@@ -887,6 +887,85 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
     }
 }
 
+// Float YUV supports only Add/Subtract here. Resolve operation and masking
+// once, and use direct contiguous loads except for the bounded final vector.
+// Arithmetic stays binary64, including the original desaturation division.
+template <bool add, bool masked>
+void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, const cp_const_yuv* masks,
+                         cp_yuv output, cp_rows r) {
+  const hn::ScalableTag<double> d;
+  using SampleTag = hn::Rebind<float, hn::ScalableTag<double>>;
+  const SampleTag dt;
+  const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, c->opacity);
+  const auto over = hn::Set(d, 32.0 / 255), upper_limit = hn::Set(d, 1 + 32.0 / 255);
+  const cp_const_plane a[3]{base.y, base.u, base.v}, b[3]{source.y, source.u, source.v};
+  const cp_const_plane m[3]{masked ? masks->y : cp_const_plane{}, masked ? masks->u : cp_const_plane{},
+                            masked ? masks->v : cp_const_plane{}};
+  const cp_plane out[3]{output.y, output.u, output.v};
+  const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const float* ap[3];
+    const float* bp[3];
+    const float* mp[3];
+    float* dst[3];
+    for (int p = 0; p < 3; ++p) {
+      ap[p] = reinterpret_cast<const float*>(address(a[p], 0, y));
+      bp[p] = reinterpret_cast<const float*>(address(b[p], 0, y));
+      mp[p] = masked ? reinterpret_cast<const float*>(address(m[p], 0, y)) : nullptr;
+      dst[p] = reinterpret_cast<float*>(address(out[p], 0, y));
+    }
+    const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
+      const int x = static_cast<int>(xx);
+      const auto load = [&](cp_const_plane plane, const float* ptr) HWY_ATTR {
+        if constexpr (decltype(direct)::value)
+          return hn::LoadU(dt, ptr + xx);
+        else
+          return LoadChannel(dt, plane, x, y, count);
+      };
+      const auto original_y = load(a[0], ap[0]), original_u = load(a[1], ap[1]), original_v = load(a[2], ap[2]);
+      auto unchanged = hn::Eq(zero, zero);
+      const auto blend = [&](auto original, int p) HWY_ATTR {
+        const auto av = hn::PromoteTo(d, original), bv = hn::PromoteTo(d, load(b[p], bp[p]));
+        const auto weight = masked ? hn::Mul(opacity, hn::PromoteTo(d, load(m[p], mp[p]))) : opacity;
+        unchanged = hn::And(unchanged, hn::Eq(weight, zero));
+        const auto delta = hn::Mul(bv, weight);
+        return add ? hn::Add(av, delta) : hn::Sub(av, delta);
+      };
+      auto vy = blend(original_y, 0);
+      const auto vu = blend(original_u, 1), vv = blend(original_v, 2);
+      const auto overflow = add ? hn::Gt(vy, one) : hn::Lt(vy, zero);
+      const auto fade = add ? hn::Div(hn::Sub(upper_limit, vy), over) : hn::Add(one, hn::Div(vy, over));
+      // Ordered comparisons reproduce std::max(0, NaN), and avoid clamping
+      // the opposite luma endpoint (float Add/Subtract deliberately differ).
+      const auto keep = hn::IfThenElse(overflow, hn::IfThenElse(hn::Gt(fade, zero), fade, zero), one);
+      vy = hn::IfThenElse(overflow, add ? one : zero, vy);
+      const auto desaturate = [&](auto value) HWY_ATTR {
+        auto faded = hn::Mul(value, keep);
+        // Scalar chroma includes +0 after multiplication; retain its zero sign.
+        faded = hn::IfThenElse(hn::Eq(faded, zero), zero, faded);
+        return hn::IfThenElse(hn::Ne(keep, one), faded, value);
+      };
+      // All source, base and mask channels have been loaded before any store,
+      // including original endpoint bits needed for exact in-place execution.
+      const auto store = [&](auto original, auto value, int p) HWY_ATTR {
+        const auto result = hn::IfThenElse(hn::DemoteMaskTo(dt, d, unchanged), original, hn::DemoteTo(dt, value));
+        if constexpr (decltype(direct)::value)
+          hn::StoreU(result, dt, dst[p] + xx);
+        else
+          StoreChannel(result, dt, out[p], x, y, count);
+      };
+      store(original_y, vy, 0);
+      store(original_u, desaturate(vu), 1);
+      store(original_v, desaturate(vv), 2);
+    };
+    size_t x = 0;
+    for (; x < end; x += n)
+      block(std::true_type{}, x, n);
+    if (x < width)
+      block(std::false_type{}, x, width - x);
+  }
+}
+
 template <class T>
 void YuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, const cp_const_yuv* mask, cp_yuv output,
              cp_rows r) {
@@ -907,17 +986,13 @@ void YuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, con
     return;
   }
   if constexpr (!std::is_same<T, float>::value) {
-    if (c->operation == CP_YUV_ADD) {
-      IntegerYuvAddSubtract<T, true>(c, base, source, mask, output, r);
-      return;
-    }
-    if (c->operation == CP_YUV_SUBTRACT) {
-      IntegerYuvAddSubtract<T, false>(c, base, source, mask, output, r);
-      return;
-    }
-  }
-  if constexpr (!std::is_same<T, float>::value) {
     switch (c->operation) {
+      case CP_YUV_ADD:
+        IntegerYuvAddSubtract<T, true>(c, base, source, mask, output, r);
+        return;
+      case CP_YUV_SUBTRACT:
+        IntegerYuvAddSubtract<T, false>(c, base, source, mask, output, r);
+        return;
       case CP_YUV_SOFT_LIGHT:
         IntegerYuvArtistic<T, CP_YUV_SOFT_LIGHT>(c, base, source, mask, output, r);
         return;
@@ -931,113 +1006,19 @@ void YuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, con
         IntegerYuvArtistic<T, CP_YUV_EXCLUSION>(c, base, source, mask, output, r);
         return;
     }
-  }
-  const hn::ScalableTag<double> d;
-  const hn::Rebind<T, decltype(d)> dt;
-  const size_t lanes = hn::Lanes(d);
-  constexpr bool floating = std::is_same<T, float>::value;
-  const double maximum = cp::maximum(c->format), half = floating ? 0 : (maximum + 1) / 2,
-               over = floating ? 32.0 / 255 : (maximum + 1) / 8;
-  const auto zero = hn::Zero(d), one = hn::Set(d, 1), max = hn::Set(d, maximum), center = hn::Set(d, half),
-             round = hn::Set(d, 0.5);
-  const cp_const_plane a[3] = {base.y, base.u, base.v}, b[3] = {source.y, source.u, source.v};
-  const cp_plane out[3] = {output.y, output.u, output.v};
-  const cp_const_plane m[3] = {mask ? mask->y : cp_const_plane{}, mask ? mask->u : cp_const_plane{},
-                               mask ? mask->v : cp_const_plane{}};
-  for (int y = r.first; y < r.first + r.count; ++y)
-    for (size_t xx = 0; xx < static_cast<size_t>(r.width); xx += lanes) {
-      const int x = static_cast<int>(xx);
-      const size_t count = std::min(lanes, static_cast<size_t>(r.width) - xx);
-      hn::VFromD<decltype(d)> av_0, av_1, av_2, bv_0, bv_1, bv_2, w_0, w_1, w_2, v_0, v_1, v_2;
-      for (int p = 0; p < 3; ++p) {
-        VectorChannel(av_0, av_1, av_2, p) = LoadDouble<T>(d, a[p], x, y, count);
-        VectorChannel(bv_0, bv_1, bv_2, p) = LoadDouble<T>(d, b[p], x, y, count);
-        const auto mv = mask ? LoadDouble<T>(d, m[p], x, y, count) : max;
-        if constexpr (floating)
-          VectorChannel(w_0, w_1, w_2, p) = hn::Mul(hn::Set(d, c->opacity), hn::Div(mv, max));
-        else
-          VectorChannel(w_0, w_1, w_2, p) = hn::Div(
-              hn::Floor(hn::Add(hn::Div(hn::Mul(mv, hn::Set(d, std::floor(c->opacity * maximum + 0.5))), max), round)),
-              max);
-      }
-      const auto unchanged = hn::And(hn::And(hn::Eq(w_0, zero), hn::Eq(w_1, zero)), hn::Eq(w_2, zero));
-      for (int p = 0; p < 3; ++p) {
-        auto target = VectorChannel(bv_0, bv_1, bv_2, p);
-        switch (c->operation) {
-          case CP_YUV_ADD:
-          case CP_YUV_SUBTRACT: {
-            auto delta = hn::Mul(hn::Sub(VectorChannel(bv_0, bv_1, bv_2, p), p ? center : zero),
-                                 VectorChannel(w_0, w_1, w_2, p));
-            if constexpr (!floating)
-              delta = hn::CopySign(hn::Floor(hn::Add(hn::Abs(delta), round)), delta);
-            VectorChannel(v_0, v_1, v_2, p) = c->operation == CP_YUV_ADD
-                                                  ? hn::Add(VectorChannel(av_0, av_1, av_2, p), delta)
-                                                  : hn::Sub(VectorChannel(av_0, av_1, av_2, p), delta);
-            continue;
-          }
-          case CP_YUV_SOFT_LIGHT:
-            target = hn::Sub(hn::Add(VectorChannel(av_0, av_1, av_2, p), VectorChannel(bv_0, bv_1, bv_2, p)), center);
-            break;
-          case CP_YUV_HARD_LIGHT:
-            target = hn::Add(VectorChannel(av_0, av_1, av_2, p),
-                             hn::Mul(hn::Set(d, p ? 1 : 2), hn::Sub(VectorChannel(bv_0, bv_1, bv_2, p), center)));
-            break;
-          case CP_YUV_DIFFERENCE:
-            target = hn::Add(hn::Abs(hn::Sub(VectorChannel(av_0, av_1, av_2, p), VectorChannel(bv_0, bv_1, bv_2, p))),
-                             center);
-            break;
-          default:
-            target = hn::Floor(hn::Div(hn::Add(hn::Mul(hn::Sub(max, VectorChannel(av_0, av_1, av_2, p)), bv_0),
-                                               hn::Mul(hn::Sub(max, bv_0), VectorChannel(av_0, av_1, av_2, p))),
-                                       max));
-            break;
-        }
-        VectorChannel(v_0, v_1, v_2, p) =
-            Mix(d, VectorChannel(av_0, av_1, av_2, p), target, VectorChannel(w_0, w_1, w_2, p));
-        if constexpr (!floating)
-          VectorChannel(v_0, v_1, v_2, p) = hn::Floor(hn::Add(VectorChannel(v_0, v_1, v_2, p), round));
-      }
-      auto upper = hn::Gt(v_0, max), lower = hn::Lt(v_0, zero);
-      if constexpr (floating) {
-        if (c->operation != CP_YUV_ADD)
-          upper = hn::Eq(zero, one);
-        if (c->operation != CP_YUV_SUBTRACT)
-          lower = hn::Eq(zero, one);
-      }
-      // std::max(0, NaN) in the scalar path returns 0. Ordered comparisons select
-      // the branch first; finite ordinary image values follow the same operations.
-      const auto up = hn::Div(hn::Sub(hn::Set(d, maximum + (floating ? 0 : 1) + over), v_0), hn::Set(d, over));
-      const auto lo = hn::Add(one, hn::Div(v_0, hn::Set(d, over)));
-      auto keep = hn::IfThenElse(upper, hn::IfThenElse(hn::Gt(up, zero), up, zero),
-                                 hn::IfThenElse(lower, hn::IfThenElse(hn::Gt(lo, zero), lo, zero), one));
-      v_0 = hn::IfThenElse(upper, max, hn::IfThenElse(lower, zero, v_0));
-      for (int p = 1; p < 3; ++p) {
-        auto desaturated = hn::Add(center, hn::Mul(hn::Sub(VectorChannel(v_0, v_1, v_2, p), center), keep));
-        if constexpr (!floating)
-          desaturated = hn::Floor(desaturated);
-        else
-          // MSVC can fold the intrinsic +0 addition, retaining a negative zero
-          // from negative chroma * 0. The scalar +0 result is explicitly positive.
-          desaturated = hn::IfThenElse(hn::Eq(desaturated, zero), zero, desaturated);
-        VectorChannel(v_0, v_1, v_2, p) =
-            hn::IfThenElse(hn::Ne(keep, one), desaturated, VectorChannel(v_0, v_1, v_2, p));
-      }
-      // Load all original endpoint bits before any channel is overwritten.
-      hn::VFromD<decltype(dt)> originals_0, originals_1, originals_2;
-      if constexpr (floating)
-        for (int p = 0; p < 3; ++p)
-          VectorChannel(originals_0, originals_1, originals_2, p) = LoadChannel(dt, a[p], x, y, count);
-      for (int p = 0; p < 3; ++p) {
-        if constexpr (floating) {
-          const auto result = hn::IfThenElse(hn::DemoteMaskTo(dt, d, unchanged),
-                                             VectorChannel(originals_0, originals_1, originals_2, p),
-                                             hn::DemoteTo(dt, VectorChannel(v_0, v_1, v_2, p)));
-          StoreChannel(result, dt, out[p], x, y, count);
-        } else
-          StoreDouble<T>(hn::IfThenElse(unchanged, VectorChannel(av_0, av_1, av_2, p), VectorChannel(v_0, v_1, v_2, p)),
-                         d, c->format, out[p], x, y, count);
-      }
+  } else {
+    if (c->operation == CP_YUV_ADD) {
+      if (mask)
+        FloatYuvAddSubtract<true, true>(c, base, source, mask, output, r);
+      else
+        FloatYuvAddSubtract<true, false>(c, base, source, mask, output, r);
+    } else {
+      if (mask)
+        FloatYuvAddSubtract<false, true>(c, base, source, mask, output, r);
+      else
+        FloatYuvAddSubtract<false, false>(c, base, source, mask, output, r);
     }
+  }
 }
 #endif
 int Yuv(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b, const cp_const_yuv* m, cp_yuv out, cp_rows r) {
@@ -1123,8 +1104,8 @@ hn::VFromD<D> SampleTap(D d, cp_const_plane source, const cp_sampling* s, int x,
   }
   return hn::LoadU(d, values);
 }
-// Interior CENTER 422/420 box sampling: deinterleave each row once and reuse
-// both channels. The caller proves the whole rectangle is inside the source.
+// Interior CENTER 422/420 box sampling: load adjacent taps together. The caller
+// proves the whole rectangle is inside the source, so full vectors need no clamp.
 template <class T>
 void BoxRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_rows r) {
   using Acc = typename std::conditional<std::is_same<T, float>::value, float,
@@ -1145,6 +1126,20 @@ void BoxRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_rows 
     auto* dst = reinterpret_cast<T*>(address(out, 0, y));
     for (size_t x = 0; x < width; x += n) {
       const size_t count = std::min(n, width - x);
+      if constexpr (!std::is_same<T, float>::value) {
+        if (count == n) {
+          // Widen adjacent integer pairs directly, without deinterleaving
+          // and promoting each tap. Even four full-range U16 taps fit U32.
+          const hn::Repartition<T, decltype(d)> pairs;
+          auto sum = hn::SumsOf2(hn::LoadU(pairs, row0 + 2 * x));
+          if (s->subsample_y == 2)
+            sum = hn::Add(sum, hn::SumsOf2(hn::LoadU(pairs, row1 + 2 * x)));
+          const auto value = s->subsample_y == 2 ? hn::ShiftRight<2>(hn::Add(sum, hn::Set(d, 2)))
+                                                 : hn::ShiftRight<1>(hn::Add(sum, hn::Set(d, 1)));
+          hn::StoreU(hn::DemoteTo(dt, value), dt, dst + x);
+          continue;
+        }
+      }
       hn::VFromD<decltype(dt)> a, b, c = hn::Zero(dt), e = hn::Zero(dt);
       if (count == n) {
         hn::LoadInterleaved2(dt, row0 + 2 * x, a, b);
