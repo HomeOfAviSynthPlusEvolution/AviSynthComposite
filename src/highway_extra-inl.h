@@ -1629,6 +1629,35 @@ void IntegerKeyRows(cp_format f, cp_const_rgb rgb, cp_const_plane alpha, cp_plan
   const size_t n = hn::Lanes(d);
   const auto lr = hn::Set(d, lower[0]), lg = hn::Set(d, lower[1]), lb = hn::Set(d, lower[2]);
   const auto ur = hn::Set(d, upper[0]), ug = hn::Set(d, upper[1]), ub = hn::Set(d, upper[2]);
+  // Hoist layout and tail handling out of the full planar vector loop.
+  if (rgb.r.step == sizeof(T) && rgb.g.step == sizeof(T) && rgb.b.step == sizeof(T) && alpha.step == sizeof(T) &&
+      out.step == sizeof(T)) {
+    const size_t full = size_t(r.width) / n * n;
+    for (int y = r.first; y < r.first + r.count; ++y) {
+      const auto* rp = reinterpret_cast<const T*>(address(rgb.r, 0, y));
+      const auto* gp = reinterpret_cast<const T*>(address(rgb.g, 0, y));
+      const auto* bp = reinterpret_cast<const T*>(address(rgb.b, 0, y));
+      const auto* ap = reinterpret_cast<const T*>(address(alpha, 0, y));
+      auto* op = reinterpret_cast<T*>(address(out, 0, y));
+      const auto apply = [&](auto rr, auto gg, auto bb, auto av) HWY_ATTR {
+        const auto hit =
+            hn::And(hn::And(hn::And(hn::Ge(rr, lr), hn::Le(rr, ur)), hn::And(hn::Ge(gg, lg), hn::Le(gg, ug))),
+                    hn::And(hn::Ge(bb, lb), hn::Le(bb, ub)));
+        return hn::IfThenElse(hit, hn::Zero(d), av);
+      };
+      for (size_t x = 0; x < full; x += n)
+        hn::StoreU(apply(hn::LoadU(d, rp + x), hn::LoadU(d, gp + x), hn::LoadU(d, bp + x), hn::LoadU(d, ap + x)), d,
+                   op + x);
+      if (full != size_t(r.width)) {
+        const int x = static_cast<int>(full);
+        const size_t count = size_t(r.width) - full;
+        StoreChannel(apply(LoadChannel(d, rgb.r, x, y, count), LoadChannel(d, rgb.g, x, y, count),
+                           LoadChannel(d, rgb.b, x, y, count), LoadChannel(d, alpha, x, y, count)),
+                     d, out, x, y, count);
+      }
+    }
+    return;
+  }
   const int order = PackedOrder<T>(rgb, alpha);
   for (int y = r.first; y < r.first + r.count; ++y)
     for (size_t xx = 0; xx < size_t(r.width); xx += n) {
