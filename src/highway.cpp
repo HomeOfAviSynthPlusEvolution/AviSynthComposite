@@ -254,6 +254,68 @@ HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane 
   return CP_OK;
 }
 
+// Bounded continuous guided blend; extrapolation retains the reference path.
+template <class T, bool masked>
+HWY_NOINLINE int GuidedContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
+                                     cp_const_plane mask, cp_plane output, cp_rows r) {
+  const hn::ScalableTag<uint32_t> d;
+  const hn::Rebind<T, decltype(d)> dt;
+  const hn::Rebind<float, decltype(d)> df;
+  const hn::Rebind<int32_t, decltype(d)> di;
+  const uint32_t maximum_code = static_cast<uint32_t>(maximum(c->format));
+  const float factor = static_cast<float>(1.0 / maximum_code);
+  const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
+  const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
+                          (!masked || mask.step == sizeof(T)) && output.step == sizeof(T);
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+      const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
+      auto bv = hn::PromoteTo(d, bc);
+      const auto max = hn::Set(d, maximum_code);
+      if constexpr (sizeof(T) == 2) {
+        // The ABI permits noncanonical narrow-U16 samples, including masks
+        // above maximum which extrapolate. Keep their reference arithmetic.
+        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
+          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
+          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
+          const cp_const_plane mp = masked ? cp_const_plane{address(mask, int(x), y), mask.stride, mask.step} : cp_const_plane{};
+          const cp_plane op{address(output, int(x), y), output.stride, output.step};
+          cp_process_plane(c, ap, bp, masked ? &mp : nullptr, nullptr, &bp, op, {int(count), 1, 0, 1});
+          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
+        }
+      }
+      // With canonical codes, bounded neutral and interior opacity, all
+      // magnitudes are <= M. A conservative 32*float_epsilon*M error bound
+      // is < 0.25 code through 16 bits, hence final rounding differs <= 1.
+      const auto af = hn::ConvertTo(df, av), bf = hn::ConvertTo(df, bv);
+      const auto neutral = hn::Set(df, static_cast<float>(c->neutral));
+      const auto inv = hn::Set(df, factor), one = hn::Set(df, 1);
+      const auto w = masked ? hn::Mul(hn::Set(df, static_cast<float>(c->opacity)), hn::Mul(hn::ConvertTo(df, mv), inv))
+                            : hn::Set(df, static_cast<float>(c->opacity));
+      const auto scale = hn::Sub(one, hn::Mul(w, hn::Sub(one, hn::Mul(bf, inv))));
+      auto result = hn::Add(neutral, hn::Mul(hn::Sub(af, neutral), scale));
+      result = hn::Min(hn::Set(df, static_cast<float>(maximum_code)), hn::Max(hn::Zero(df), result));
+      const auto code = hn::DemoteTo(dt, hn::ConvertTo(di, hn::Add(result, hn::Set(df, .5f))));
+      return hn::IfThenElse(NarrowMask(dt, d, hn::Eq(mv, hn::Zero(d))), ac, code);
+    };
+    size_t x = 0;
+    if (contiguous) {
+      const auto* ap = reinterpret_cast<const T*>(address(a, 0, y));
+      const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
+      const auto* mp = masked ? reinterpret_cast<const T*>(address(mask, 0, y)) : nullptr;
+      auto* dst = reinterpret_cast<T*>(address(output, 0, y));
+      for (; x < end; x += n)
+        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Set(dt, T(maximum_code)), x, n), dt, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      StoreChannel(blend(LoadChannel(dt, a, int(x), y, count), LoadChannel(dt, b, int(x), y, count),
+                           masked ? LoadChannel(dt, mask, int(x), y, count) : hn::Set(dt, T(maximum_code)), x, count), dt, output, int(x), y, count);
+    }
+  }
+  return CP_OK;
+}
+
 // Quantize bounded affine deltas once; clip only the final sample.
 template <class T, bool masked, int operation>
 HWY_NOINLINE int ArithmeticContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
@@ -817,6 +879,15 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     if (c->format.storage == CP_U8)
       return CodePlaneRows<uint8_t>(c, a, b, mask, output, r);
     return CodePlaneRows<uint16_t>(c, a, b, mask, output, r);
+  }
+  if (c->format.storage != CP_F32 && c->operation == CP_GUIDED_MULTIPLY &&
+      c->weight_rule == CP_WEIGHT_CONTINUOUS && c->opacity > 0 && c->opacity < 1 &&
+      c->neutral >= 0 && c->neutral <= maximum(c->format)) {
+    if (c->format.storage == CP_U8)
+      return mask ? GuidedContinuousRows<uint8_t, true>(c, a, *gb, *mask, output, r)
+                  : GuidedContinuousRows<uint8_t, false>(c, a, *gb, {}, output, r);
+    return mask ? GuidedContinuousRows<uint16_t, true>(c, a, *gb, *mask, output, r)
+                : GuidedContinuousRows<uint16_t, false>(c, a, *gb, {}, output, r);
   }
   if (c->format.storage != CP_F32 && c->operation == CP_GUIDED_MULTIPLY && c->weight_rule == CP_WEIGHT_CODE &&
       c->neutral >= 0 && c->neutral <= maximum(c->format) && c->neutral == std::floor(c->neutral)) {

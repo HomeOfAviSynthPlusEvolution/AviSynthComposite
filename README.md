@@ -252,3 +252,8 @@ inputs retain scalar evaluation, and exact zero/full-weight endpoints remain exa
 Integer continuous DIFFERENCE may use Q16 weights when bias is an integer in
 [0, 65535]. Its final clipped result differs by at most 1 LSB. Fractional or
 out-of-range bias and noncanonical narrow-U16 inputs retain scalar arithmetic.
+
+Integer continuous GUIDED_MULTIPLY may use float SIMD for 0 < opacity < 1
+and neutral in [0, maximum]. Final output differs by at most 1 LSB. Full
+opacity, out-of-range neutral, and noncanonical narrow-U16 inputs retain the
+reference calculation; zero mask preserves the original code exactly.

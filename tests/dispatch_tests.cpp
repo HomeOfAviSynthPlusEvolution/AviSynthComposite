@@ -138,7 +138,7 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
               c.threshold = bits == 32 ? double(std::numeric_limits<float>::epsilon() / 2) : 7;
             CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pd, rows) == CP_OK);
             CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pe, rows) == CP_OK);
-            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT || op == CP_ADD || op == CP_SUBTRACT) &&
+            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT || op == CP_ADD || op == CP_SUBTRACT || (op == CP_GUIDED_MULTIPLY && opacity < 1)) &&
                 rule == CP_WEIGHT_CONTINUOUS && opacity != 0) {
               for (int y = rows.first; y < rows.first + rows.count; ++y)
                 for (int x = 0; x < width; ++x) {
@@ -387,6 +387,46 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
       }
 }
 
+template <class T>
+static void GuidedBounded(const cp_kernels* k, int bits) {
+  constexpr int count = 65539;
+  const int max = (1 << bits) - 1;
+  std::vector<T> a(count), b(count), m(count), got(count), ref(count);
+  std::mt19937 rng(bits + 777);
+  for (int i = 0; i < count; ++i) {
+    a[i] = T(rng() & max); b[i] = T(rng() & max); m[i] = T(i & max);
+  }
+  const ptrdiff_t pitch = count * sizeof(T);
+  const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
+  const cp_rows rows{count, 1, 0, 1};
+  for (double neutral : {0., .1, double(max) / 2, double(max), -1., double(max) + 1.})
+    for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
+      for (bool noncanonical : {false, true}) {
+        // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
+        b[33] = noncanonical ? std::numeric_limits<T>::max() : T(max / 3);
+        a[17] = noncanonical ? std::numeric_limits<T>::max() : T(max / 2);
+        m[count - 1] = noncanonical ? std::numeric_limits<T>::max() : T(max);
+        cp_plane_config c{};
+        c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
+        const int op = CP_GUIDED_MULTIPLY; c.operation = op; c.neutral = neutral; c.opacity = opacity; c.inversion_sum = max; c.bias = (max + 1) / 2; c.weight_rule = CP_WEIGHT_CONTINUOUS;
+        CHECK(cp_process_plane(&c, pa, pb, &pm, nullptr, &pb, {ref.data(), pitch, sizeof(T)}, rows) == CP_OK);
+        for (int alias = 0; alias < 4; ++alias) {
+          got = alias == 2 ? b : alias == 3 ? m : a;
+          const cp_const_plane in{got.data(), pitch, sizeof(T)};
+          const cp_const_plane mask_in = alias == 3 ? in : pm;
+          CHECK(k->process_plane(&c, alias == 1 ? in : pa, alias == 2 ? in : pb, &mask_in, nullptr, &(alias == 2 ? in : pb),
+                                  {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
+          for (int i = 0; i < count; ++i) {
+            const bool exact = opacity == 0 || opacity == 1 || neutral < 0 || neutral > max || m[i] == 0 || (opacity == 1 && m[i] == max) ||
+                                a[i] > max || b[i] > max || m[i] > max;
+            if (std::abs(int(got[i]) - int(ref[i])) > (exact ? 0 : 1))
+              std::fprintf(stderr, "quantized op=%d bits=%d opacity=%.17g alias=%d i=%d a=%u b=%u m=%u got=%u ref=%u\n", op, bits, opacity, alias, i, unsigned(a[i]), unsigned(b[i]), unsigned(m[i]), unsigned(got[i]), unsigned(ref[i]));
+            CHECK(std::abs(int(got[i]) - int(ref[i])) <= (exact ? 0 : 1));
+          }
+        }
+      }
+}
+
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -430,8 +470,10 @@ int main() {
     U8MaskedMixRounding(table, CP_ADD);
     U8MaskedMixRounding(table, CP_SUBTRACT);
     QuantizedMasked<uint8_t>(table, 8);
+    GuidedBounded<uint8_t>(table, 8);
     for (int bits = 9; bits <= 16; ++bits)
       QuantizedMasked<uint16_t>(table, bits);
+    for (int bits = 9; bits <= 16; ++bits) GuidedBounded<uint16_t>(table, bits);
     QuantizedMix<uint8_t>(table, 8);
     QuantizedMix<uint8_t>(table, 8, CP_INVERT_MIX);
     for (int bits = 9; bits <= 16; ++bits)
