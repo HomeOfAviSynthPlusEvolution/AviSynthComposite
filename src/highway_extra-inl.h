@@ -781,6 +781,50 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
   }
 }
 
+// Shared-mask F32 fast path. With guide in [0,1] and opacity <= .75,
+// the factor is in [.25,1], avoiding cancellation and overflow. The
+// relative error is bounded by 8*float_epsilon, plus subnormal rounding.
+void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b,
+                            const cp_const_yuv* m, cp_yuv out, cp_rows r) {
+  const hn::ScalableTag<float> d;
+  const size_t n = hn::Lanes(d);
+  const auto zero = hn::Zero(d), one = hn::Set(d, 1.f);
+  const auto opacity = hn::Set(d, float(c->opacity));
+  const auto largest = hn::Set(d, std::numeric_limits<float>::max());
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    size_t x = 0;
+    for (; x + n <= size_t(r.width); x += n) {
+      const auto load = [&](cp_const_plane p) HWY_ATTR {
+        return hn::LoadU(d, reinterpret_cast<const float*>(address(p, int(x), y)));
+      };
+      const auto guide = load(b.y), mask = load(m->y);
+      const auto ay = load(a.y), au = load(a.u), av = load(a.v);
+      const auto finite = hn::And(hn::Le(hn::Abs(ay), largest),
+                         hn::And(hn::Le(hn::Abs(au), largest), hn::Le(hn::Abs(av), largest)));
+      if (!hn::AllTrue(d, hn::And(finite, hn::And(hn::Ge(guide, zero), hn::Le(guide, one))))) {
+        const auto input = [&](cp_const_plane p) { return cp_const_plane{address(p, int(x), y), p.stride, p.step}; };
+        const auto output = [&](cp_plane p) { return cp_plane{address(p, int(x), y), p.stride, p.step}; };
+        const cp_const_yuv aa{input(a.y), input(a.u), input(a.v)}, bb{input(b.y), input(b.u), input(b.v)};
+        const cp_const_yuv mm{input(m->y), input(m->u), input(m->v)};
+        MultiplyYuvRows<float, true>(c, aa, bb, &mm, {output(out.y), output(out.u), output(out.v)}, {int(n), 1, 0, 1});
+        continue;
+      }
+      const auto factor = hn::Sub(one, hn::Mul(hn::Mul(mask, opacity), hn::Sub(one, guide)));
+      const auto blend = [&](auto value) HWY_ATTR {
+        auto result = hn::Mul(value, factor);
+        // Reference interpolation makes a non-copy zero positive.
+        result = hn::IfThenElse(hn::Eq(result, zero), zero, result);
+        return hn::IfThenElse(hn::Eq(mask, zero), value, result);
+      };
+      const auto yy = blend(ay), uu = blend(au), vv = blend(av);
+      hn::StoreU(yy, d, reinterpret_cast<float*>(address(out.y, int(x), y)));
+      hn::StoreU(uu, d, reinterpret_cast<float*>(address(out.u, int(x), y)));
+      hn::StoreU(vv, d, reinterpret_cast<float*>(address(out.v, int(x), y)));
+    }
+    MultiplyYuvTail(c, a, b, m, out, {r.width, r.height, y, 1}, x);
+  }
+}
+
 // Integer Add/Subtract have exact code weights. Their odd denominator
 // keeps delta rounding away from half ties (at least 1/(2*M)), much farther
 // than binary64 normalization/multiplication error. Desaturation divides by
@@ -1075,6 +1119,15 @@ int Yuv(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b, const cp_const_y
     return CP_INVALID_ARGUMENT;
 #if HWY_HAVE_FLOAT64
   if (c->operation == CP_YUV_MULTIPLY) {
+    if (c->format.storage == CP_F32 && m && c->opacity > 0 && c->opacity <= .75 &&
+        m->y.data == m->u.data && m->y.data == m->v.data &&
+        m->y.stride == m->u.stride && m->y.stride == m->v.stride &&
+        m->y.step == 4 && m->u.step == 4 && m->v.step == 4 &&
+        a.y.step == 4 && a.u.step == 4 && a.v.step == 4 && b.y.step == 4 &&
+        out.y.step == 4 && out.u.step == 4 && out.v.step == 4) {
+      MultiplyYuvFloatShared(c, a, b, m, out, r);
+      return CP_OK;
+    }
     if (c->format.storage == CP_F32 && !m && c->opacity > 0 && c->opacity < 1 &&
         a.y.step == 4 && a.u.step == 4 && a.v.step == 4 && b.y.step == 4 &&
         out.y.step == 4 && out.u.step == 4 && out.v.step == 4) {

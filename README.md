@@ -85,7 +85,7 @@ may similarly quantize their combined effective weight to Q16 within 1 LSB.
 Exact zero-weight and
 full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for interior opacity, as
 described below. These allowances do not extend to other operations (except additional integer operations documented below), code weights,
-or F32. Repeated
+or F32 plane operations. F32 YUV Multiply has a separate allowance below. Repeated
 operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
 for reference arithmetic; increasing working bit depth before processing reduces
 the normalized size of a code-value error.
@@ -239,7 +239,7 @@ semantic clarifications. No upstream golden source is distributed in this tree.
 Integer YUV Overlay Multiply may use binary32 SIMD for interior opacity
 (0 < opacity < 1). For canonical input codes, the final output differs
 from the scalar reference by at most 1 LSB. Zero and full opacity retain their
-existing exact behavior; floating-point formats are unchanged.
+existing exact behavior. F32 has the separate allowance below.
 
 Integer continuous PRODUCT may quantize its blend weight to Q16, with at most
 1 LSB output difference. The product is still floored before blending.
@@ -261,3 +261,12 @@ required by `types.h` (10-bit: 0..1023, not the narrower video limited range).
 SIMD kernels do not scan for violations or guarantee scalar-equivalent results
 for them. Geometry and descriptor validation, and bounds-safe access, remain
 unchanged. F32 color excursions remain supported under their existing contract.
+
+F32 YUV Overlay Multiply with continuous, shared-mask planes and
+0 < opacity <= .75 may use binary32 arithmetic when guide Y is in [0,1]
+and the base colors are finite. Its error relative to scalar is bounded by
+`8 * FLT_EPSILON * abs(reference) + 2 * FLT_TRUE_MIN` (about 0.0000954%
+relative error, plus subnormal rounding). Zero mask preserves input bits.
+Out-of-range guide values, nonfinite colors and other configurations retain
+reference arithmetic. This does not restrict valid F32 color excursions.
+Use `cp_process_yuv` / `CP_TARGET_C` for reference arithmetic.

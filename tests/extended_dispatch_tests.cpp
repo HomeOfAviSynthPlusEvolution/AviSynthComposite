@@ -704,6 +704,65 @@ void IntegerYuvEdges(const cp_kernels* k, int bits) {
   }
 }
 
+static void SharedFloatMultiply(const cp_kernels* k) {
+  constexpr int count = 4099;
+  std::mt19937 rng(9182);
+  double largest_error = 0;
+  for (bool negative : {false, true})
+    for (double opacity : {.003, .17, .625, .75, std::nextafter(.75, 1.), 1.})
+      for (int scenario = 0; scenario < 4; ++scenario) {
+        Image<float> proto(count, 2, 1, negative);
+        std::array<Image<float>, 3> a{proto, proto, proto};
+        auto guide = proto, mask = proto;
+        for (size_t i = 0; i < proto.data.size(); ++i) {
+          guide.data[i] = float(rng() % 65536) / 65535.f;
+          mask.data[i] = i % 7 == 0 ? 0.f : i % 7 == 1 ? 1.f : float(rng() % 65536) / 65535.f;
+          for (int p = 0; p < 3; ++p) {
+            float v = float(int(rng() % 131073) - 65536) / 65536.f;
+            if (scenario == 1) v *= 16;
+            if (scenario == 2) v = std::ldexp(v, int(i % 254) - 126);
+            if (scenario == 3) v = i % 3 == 0 ? -0.f : i % 3 == 1 ? std::numeric_limits<float>::max() : -1.f;
+            a[p].data[i] = v;
+          }
+          if (scenario == 3) guide.data[i] = i % 4 == 0 ? -2.f : i % 4 == 1 ? 4.f : guide.data[i];
+        }
+        for (int alias = 0; alias < 3; ++alias) {
+          auto got = a, ref = a;
+          if (alias == 2) got[0] = ref[0] = mask;
+          const cp_const_yuv input{a[0].in(), a[1].in(), a[2].in()};
+          const cp_const_yuv gg{guide.in(), guide.in(), guide.in()};
+          const auto gm = alias == 2 ? got[0].in() : mask.in();
+          const auto rm = alias == 2 ? ref[0].in() : mask.in();
+          const cp_const_yuv gmask{gm, gm, gm}, rmask{rm, rm, rm};
+          const cp_const_yuv ga = alias == 1 ? cp_const_yuv{got[0].in(), got[1].in(), got[2].in()} : input;
+          const cp_const_yuv ra = alias == 1 ? cp_const_yuv{ref[0].in(), ref[1].in(), ref[2].in()} : input;
+          const cp_yuv_config c{format(32), CP_YUV_MULTIPLY, opacity};
+          CHECK(k->process_yuv(&c, ga, gg, &gmask, {got[0].out(), got[1].out(), got[2].out()}, proto.rows()) == CP_OK);
+          CHECK(cp_process_yuv(&c, ra, gg, &rmask, {ref[0].out(), ref[1].out(), ref[2].out()}, proto.rows()) == CP_OK);
+          for (int p = 0; p < 3; ++p) for (int y = 0; y < 2; ++y) for (int x = 0; x < count; ++x) {
+            const int j = proto.origin + y * proto.pitch + x;
+            const float v = got[p].data[j], expected = ref[p].data[j];
+            if (mask.data[j] == 0 || opacity > .75 || guide.data[j] < 0 || guide.data[j] > 1)
+              CHECK(std::memcmp(&v, &expected, sizeof(float)) == 0);
+            else {
+              const double error = std::abs(double(v) - expected);
+              const double limit = 8 * std::numeric_limits<float>::epsilon() * std::abs(double(expected)) +
+                                   2 * double(std::numeric_limits<float>::denorm_min());
+              CHECK(error <= limit);
+              if (scenario == 0) largest_error = std::max(largest_error, error);
+            }
+          }
+          // Row padding remains byte exact.
+          for (size_t j = 0; j < proto.data.size(); ++j) {
+            bool pixel = false;
+            for (int y = 0; y < 2; ++y) pixel |= ptrdiff_t(j) >= proto.origin + y * proto.pitch && ptrdiff_t(j) < proto.origin + y * proto.pitch + count;
+            if (!pixel) for (int p = 0; p < 3; ++p) CHECK(got[p].data[j] == ref[p].data[j]);
+          }
+        }
+      }
+  std::printf("shared float multiply normalized max error %.9g\n", largest_error);
+}
+
 int main() {
   std::vector<int64_t> targets = {0};
   for (int64_t remaining = cp_supported_targets(); remaining; remaining &= remaining - 1)
@@ -711,6 +770,7 @@ int main() {
   for (auto target : targets) {
     const auto* k = cp_get_kernels(target);
     CHECK(k && k->process_yuv && k->resample_mask && k->affine && k->clamp && k->rgb_luma && k->color_key);
+    SharedFloatMultiply(k);
     std::printf("extended target 0x%llx\n", static_cast<unsigned long long>(target));
     std::fflush(stdout);
     for (int width : {1, 3, 7, 16, 31, 65, 129})
