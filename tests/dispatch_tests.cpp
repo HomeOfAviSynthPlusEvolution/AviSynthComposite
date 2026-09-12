@@ -42,6 +42,8 @@ void CheckLayout(const cp_kernels* table, int bits, int width, int step, bool ne
   };
   CHECK(table->copy(f, pa, pd, rows) == cp_copy(f, pa, pe, rows));
   same();
+  CHECK(table->copy(f, {pd.data, pd.stride, pd.step}, pd, rows) == CP_OK);
+  same();
   for (double v : {-13.0, 0.0, -0.0, 0.5, 193.5, 65535.0, 99999.0}) {
     CHECK(table->fill(f, pd, rows, v) == cp_fill(f, pe, rows, v));
     same();
@@ -177,21 +179,22 @@ static void FloatBlendSpecials(const cp_kernels* table) {
     m[i] = i % 5 == 0 ? 0 : i % 5 == 1 ? 1 : i % 5 == 2 ? .3f : i % 5 == 3 ? -1 : 2;
   }
   const cp_const_plane pa{a, n * 4, 4}, pb{b, n * 4, 4}, pm{m, n * 4, 4};
-  for (int op : {CP_MIX, CP_PRODUCT})
-    for (double opacity : {0.0, .17, .625, 1.0})
-      for (bool masked : {false, true}) {
-        const cp_plane_config c{{CP_F32, 32}, op, opacity, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
-        CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, nullptr, nullptr, {actual, n * 4, 4},
-                                   {n, 1, 0, 1}) == CP_OK);
-        CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, nullptr, nullptr, {expected, n * 4, 4},
-                               {n, 1, 0, 1}) == CP_OK);
-        for (int i = 0; i < n; ++i) {
-          // Non-endpoint arithmetic may choose a different quiet NaN payload.
-          if (std::isnan(actual[i]) && std::isnan(expected[i]))
-            continue;
-          CHECK(std::memcmp(actual + i, expected + i, 4) == 0);
+  for (int op : {CP_MIX, CP_PRODUCT, CP_GUIDED_MULTIPLY})
+    for (double neutral : {-0.0, .1, -1e300})
+      for (double opacity : {0.0, .17, .625, 1.0})
+        for (bool masked : {false, true}) {
+          const cp_plane_config c{{CP_F32, 32}, op, opacity, neutral, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+          CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, nullptr, &pb, {actual, n * 4, 4},
+                                     {n, 1, 0, 1}) == CP_OK);
+          CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, nullptr, &pb, {expected, n * 4, 4},
+                                 {n, 1, 0, 1}) == CP_OK);
+          for (int i = 0; i < n; ++i) {
+            // Non-endpoint arithmetic may choose a different quiet NaN payload.
+            if ((!masked || m[i] * opacity != 0) && opacity != 0 && std::isnan(actual[i]) && std::isnan(expected[i]))
+              continue;
+            CHECK(std::memcmp(actual + i, expected + i, 4) == 0);
+          }
         }
-      }
 }
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));

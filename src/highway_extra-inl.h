@@ -738,8 +738,8 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
           VectorChannel(values_0, values_1, values_2, p) =
               hn::DemoteTo(dt, hn::DemoteInRangeTo(di, hn::Add(result, hn::Set(d, .5))));
         }
-        VectorChannel(values_0, values_1, values_2, p) = hn::IfThenElse(
-            hn::DemoteMaskTo(dt, d, hn::Eq(w, zero)), original, VectorChannel(values_0, values_1, values_2, p));
+        VectorChannel(values_0, values_1, values_2, p) = hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, zero)), original,
+                                                                        VectorChannel(values_0, values_1, values_2, p));
       }
       for (int p = 0; p < 3; ++p) {
         if constexpr (decltype(direct)::value)
@@ -948,7 +948,7 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       // All source, base and mask channels have been loaded before any store,
       // including original endpoint bits needed for exact in-place execution.
       const auto store = [&](auto original, auto value, int p) HWY_ATTR {
-        const auto result = hn::IfThenElse(hn::DemoteMaskTo(dt, d, unchanged), original, hn::DemoteTo(dt, value));
+        const auto result = hn::IfThenElse(NarrowMask(dt, d, unchanged), original, hn::DemoteTo(dt, value));
         if constexpr (decltype(direct)::value)
           hn::StoreU(result, dt, dst[p] + xx);
         else
@@ -1277,23 +1277,50 @@ void ScatterFloat(hn::VFromD<D> value, D d, float* p, hn::VFromD<hn::Rebind<int3
 #if HWY_HAVE_FLOAT64
 template <class T, bool Clamp>
 void UnaryRows(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, double first, double second) {
-  if constexpr (Clamp && !std::is_same<T, float>::value) {
-    // Rounding and saturation are monotone and leave integral samples fixed.
-    // Quantizing the two bounds therefore commutes with clamping an integer.
+  if constexpr (!std::is_same<T, float>::value) {
     const double maximum = cp::maximum(f);
-    const T lower = T(std::floor(std::clamp(first, 0.0, maximum) + .5));
-    const T upper = T(std::floor(std::clamp(second, 0.0, maximum) + .5));
-    const hn::ScalableTag<T> d;
-    const size_t n = hn::Lanes(d);
-    const auto low = hn::Set(d, lower), high = hn::Set(d, upper);
-    for (int y = r.first; y < r.first + r.count; ++y)
-      for (size_t xx = 0; xx < size_t(r.width); xx += n) {
-        const int x = static_cast<int>(xx);
-        const size_t count = std::min(n, size_t(r.width) - xx);
-        const auto value = LoadChannel(d, source, x, y, count);
-        StoreChannel(hn::Min(high, hn::Max(low, value)), d, out, x, y, count);
+    if (Clamp || (first == -1 && second == maximum)) {
+      // Quantization commutes with integer clamping. Inversion is an exact
+      // saturated subtraction, including noncanonical input codes above max.
+      const T lower = T(std::floor(std::clamp(first, 0.0, maximum) + .5));
+      const T upper = T(std::floor(std::clamp(second, 0.0, maximum) + .5));
+      const hn::ScalableTag<T> d;
+      const size_t n = hn::Lanes(d);
+      const auto low = hn::Set(d, lower), high = hn::Set(d, upper);
+      for (int y = r.first; y < r.first + r.count; ++y)
+        for (size_t xx = 0; xx < size_t(r.width); xx += n) {
+          const int x = static_cast<int>(xx);
+          const size_t count = std::min(n, size_t(r.width) - xx);
+          const auto value = LoadChannel(d, source, x, y, count);
+          const auto result = Clamp ? hn::Min(high, hn::Max(low, value)) : hn::SaturatedSub(high, value);
+          StoreChannel(result, d, out, x, y, count);
+        }
+      return;
+    }
+  }
+  if constexpr (Clamp && std::is_same<T, float>::value) {
+    // Exactly representable bounds permit binary32 comparisons at twice the
+    // lane count. Ordered selects preserve signed zero, and NaN maps to low.
+    // Other bounds retain binary64 comparisons (rounding a bound can matter).
+    if (std::abs(first) <= std::numeric_limits<float>::max() && std::abs(second) <= std::numeric_limits<float>::max()) {
+      const float lower = static_cast<float>(first), upper = static_cast<float>(second);
+      if (double(lower) == first && double(upper) == second) {
+        const hn::ScalableTag<float> d;
+        const auto low = hn::Set(d, lower), high = hn::Set(d, upper);
+        const size_t n = hn::Lanes(d);
+        for (int y = r.first; y < r.first + r.count; ++y)
+          for (size_t xx = 0; xx < size_t(r.width); xx += n) {
+            const int x = static_cast<int>(xx);
+            const size_t count = std::min(n, size_t(r.width) - xx);
+            const auto value = LoadChannel(d, source, x, y, count);
+            const auto result = hn::IfThenElse(
+                hn::IsNaN(value), low,
+                hn::IfThenElse(hn::Lt(value, low), low, hn::IfThenElse(hn::Gt(value, high), high, value)));
+            StoreChannel(result, d, out, x, y, count);
+          }
+        return;
       }
-    return;
+    }
   }
   // A single strided channel does not authorize reading adjacent channels.
   // Direct typed accesses avoid packing every vector into temporary arrays.
@@ -1617,8 +1644,8 @@ void KeyRows(cp_format f, cp_const_rgb rgb, cp_const_plane alpha, cp_plane out, 
                                 hn::Set(d, tolerance[1])));
       hit = hn::And(hit, hn::Le(hn::Abs(hn::Sub(LoadDouble<T>(d, rgb.b, x, y, count), hn::Set(d, key[2]))),
                                 hn::Set(d, tolerance[2])));
-      StoreChannel(hn::IfThenElse(hn::DemoteMaskTo(dt, d, hit), hn::Zero(dt), LoadChannel(dt, alpha, x, y, count)), dt,
-                   out, x, y, count);
+      StoreChannel(hn::IfThenElse(NarrowMask(dt, d, hit), hn::Zero(dt), LoadChannel(dt, alpha, x, y, count)), dt, out,
+                   x, y, count);
     }
 }
 #endif

@@ -283,6 +283,18 @@ static void FloatSpecials(const cp_kernels* k) {
   CHECK(k->clamp(f, a.in(), got.out(), a.rows(), -0.0, 1) == CP_OK);
   CHECK(cp_clamp(f, a.in(), ref.out(), a.rows(), -0.0, 1) == CP_OK);
   same(got, ref, "float clamp specials");
+  // Exact and non-binary32 bounds must agree on zero signs and rounding.
+  const double huge = std::numeric_limits<double>::max();
+  for (const auto& bounds : {std::array<double, 2>{0.0, -0.0},
+                             {-0.0, -0.0},
+                             {-1, 1},
+                             {std::nextafter(0.0, -1.0), std::nextafter(1.0, 2.0)},
+                             {.1, .9},
+                             {-huge, huge}}) {
+    CHECK(k->clamp(f, a.in(), got.out(), a.rows(), bounds[0], bounds[1]) == CP_OK);
+    CHECK(cp_clamp(f, a.in(), ref.out(), a.rows(), bounds[0], bounds[1]) == CP_OK);
+    same(got, ref, "float clamp bound rounding");
+  }
   const cp_const_rgb rgb = {a.in(), a.in(), a.in()};
   const double key[] = {0, 0, 0}, tol[] = {0, 0, 0};
   CHECK(k->color_key(f, rgb, alpha.in(), got.out(), a.rows(), key, tol) == CP_OK);
@@ -542,6 +554,43 @@ void IntegerKeyThresholds(const cp_kernels* k, int bits) {
 }
 
 template <class T>
+void GuidedLimits(const cp_kernels* k, int bits) {
+  const auto f = format(bits);
+  const double maximum = bits == 32 ? 1 : (1u << bits) - 1;
+  Image<T> a(67, 3, 1, true), guide = a, mask = a, got = a, ref = a;
+  a.populate(bits, 137);
+  guide.populate(bits, 131);
+  for (size_t i = 0; i < mask.data.size(); ++i) {
+    mask.data[i] = T(i % 3 == 0 ? 0 : i % 3 == 1 ? maximum : maximum / 3);
+    if (i % 7 == 0)
+      a.data[i] = std::numeric_limits<T>::max();
+  }
+  const double huge = std::numeric_limits<double>::max();
+  for (double neutral : {-huge, -0.0, .1, maximum / 2, huge})
+    for (double opacity : {.17, 1.0})
+      for (bool masked : {false, true}) {
+        const cp_plane_config c{f, CP_GUIDED_MULTIPLY, opacity, neutral, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+        const auto mv = mask.in(), gv = guide.in();
+        CHECK(k->process_plane(&c, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, got.out(), a.rows()) ==
+              CP_OK);
+        CHECK(cp_process_plane(&c, a.in(), guide.in(), masked ? &mv : nullptr, nullptr, &gv, ref.out(), a.rows()) ==
+              CP_OK);
+        same(got, ref, "guided extreme neutral and endpoint codes");
+        // The guide and mask may be exact aliases of the destination.
+        for (bool alias_mask : {false, true}) {
+          got = ref = alias_mask ? mask : guide;
+          const auto gm = alias_mask ? got.in() : mv, rm = alias_mask ? ref.in() : mv;
+          const auto gg = alias_mask ? gv : got.in(), rg = alias_mask ? gv : ref.in();
+          CHECK(k->process_plane(&c, a.in(), guide.in(), masked ? &gm : nullptr, nullptr, &gg, got.out(), a.rows()) ==
+                CP_OK);
+          CHECK(cp_process_plane(&c, a.in(), guide.in(), masked ? &rm : nullptr, nullptr, &rg, ref.out(), a.rows()) ==
+                CP_OK);
+          same(got, ref, "guided guide/mask in-place");
+        }
+      }
+}
+
+template <class T>
 void IntegerClampLimits(const cp_kernels* k, int bits) {
   const int width = 1 << bits;
   const double maximum = width - 1, huge = std::numeric_limits<double>::max();
@@ -565,6 +614,17 @@ void IntegerClampLimits(const cp_kernels* k, int bits) {
     CHECK(k->clamp(format(bits), got.in(), got.out(), source.rows(), range[0], range[1]) == CP_OK);
     same(got, ref, "integer clamp in-place limits");
   }
+  // Include all storage codes, even values beyond a sub-16-bit format's max.
+  const int codes = 1 << (sizeof(T) * 8);
+  Image<T> input(codes + 1, 1, 1, false), inverted = input, expected = input;
+  for (int x = 0; x <= codes; ++x)
+    input.data[x] = T(x);
+  CHECK(k->affine(format(bits), input.in(), inverted.out(), input.rows(), -1, maximum) == CP_OK);
+  CHECK(cp_affine(format(bits), input.in(), expected.out(), input.rows(), -1, maximum) == CP_OK);
+  same(inverted, expected, "integer inversion storage codes");
+  inverted = input;
+  CHECK(k->affine(format(bits), inverted.in(), inverted.out(), input.rows(), -1, maximum) == CP_OK);
+  same(inverted, expected, "integer inversion in-place storage codes");
 }
 
 template <class T>
@@ -658,6 +718,10 @@ int main() {
     IntegerYuvEdges<uint8_t>(k, 8);
     for (int bits = 9; bits <= 16; ++bits)
       IntegerYuvEdges<uint16_t>(k, bits);
+    GuidedLimits<uint8_t>(k, 8);
+    for (int bits = 9; bits <= 16; ++bits)
+      GuidedLimits<uint16_t>(k, bits);
+    GuidedLimits<float>(k, 32);
     IntegerClampLimits<uint8_t>(k, 8);
     for (int bits = 9; bits <= 16; ++bits)
       IntegerClampLimits<uint16_t>(k, bits);

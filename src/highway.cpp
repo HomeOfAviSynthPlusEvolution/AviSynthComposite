@@ -175,6 +175,20 @@ int CodePlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, 
 }
 
 #if HWY_HAVE_FLOAT64
+// Vector-backed comparison masks contain only zero or all-one lanes. Truncating
+// their bits is exact and avoids the general saturating i64 demotion sequence.
+// Targets with compact mask registers retain Highway's native mask conversion.
+template <class DTo, class DFrom, class M>
+HWY_INLINE auto NarrowMask(DTo to, DFrom from, M mask) {
+#if HWY_TARGET == HWY_AVX2 || HWY_TARGET == HWY_SSE4 || HWY_TARGET == HWY_SSSE3 || HWY_TARGET == HWY_SSE2
+  const hn::RebindToUnsigned<DTo> du_to;
+  const hn::RebindToUnsigned<DFrom> du_from;
+  return hn::MaskFromVec(hn::BitCast(to, hn::TruncateTo(du_to, hn::BitCast(du_from, hn::VecFromMask(from, mask)))));
+#else
+  return hn::DemoteMaskTo(to, from, mask);
+#endif
+}
+
 template <class T, class D>
 hn::VFromD<D> LoadDouble(D d, cp_const_plane p, int x, int y, size_t count) {
   const hn::Rebind<T, D> dt;
@@ -186,11 +200,11 @@ hn::VFromD<D> LoadDouble(D d, cp_const_plane p, int x, int y, size_t count) {
     return hn::PromoteTo(d, hn::ConvertTo(df, hn::PromoteTo(du, LoadChannel(dt, p, x, y, count))));
   }
 }
-// Continuous integer MIX, including non-dyadic opacity and masks. Preserve
+// Continuous integer blends, including non-dyadic opacity and masks. Preserve
 // double division/multiplication order and final rounding exactly as the C path.
-template <class T, bool masked>
-int IntegerMixRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
-                   cp_plane output, cp_rows r) {
+template <class T, int operation, bool masked>
+int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
+                     cp_plane output, cp_rows r) {
   const hn::ScalableTag<double> d;
   const hn::Rebind<T, decltype(d)> dt;
   const hn::Rebind<uint32_t, decltype(d)> du;
@@ -198,19 +212,27 @@ int IntegerMixRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
   const auto max = hn::Set(d, maximum(c->format)), zero = hn::Zero(d), half = hn::Set(d, .5);
-  const auto opacity = hn::Set(d, c->opacity);
+  const auto opacity = hn::Set(d, c->opacity), neutral = hn::Set(d, c->neutral);
   const auto promote = [&](auto v) HWY_ATTR {
     return hn::PromoteTo(d, hn::ConvertTo(df, hn::PromoteTo(du, v)));
   };
   const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
     const auto av = promote(ac), bv = promote(bc);
     const auto w = masked ? hn::Mul(opacity, hn::Div(promote(mc), max)) : opacity;
-    auto v = hn::Add(av, hn::Mul(hn::Sub(bv, av), w));
+    auto target = bv;
+    if constexpr (operation == CP_GUIDED_MULTIPLY)
+      target = hn::Add(neutral, hn::Div(hn::Mul(hn::Sub(av, neutral), bv), max));
+    auto v = hn::Add(av, hn::Mul(hn::Sub(target, av), w));
+    if constexpr (operation == CP_GUIDED_MULTIPLY) {
+      v = hn::IfThenElse(hn::Eq(w, hn::Set(d, 1)), target, v);
+      v = hn::IfThenElse(hn::IsNaN(v), zero, v);
+    }
     v = hn::Min(max, hn::Max(zero, v));
     auto code = hn::DemoteTo(dt, hn::ConvertTo(di, hn::DemoteTo(df, hn::Floor(hn::Add(v, half)))));
     // Copy endpoints retain even noncanonical input codes, as the C ABI does.
-    code = hn::IfThenElse(hn::DemoteMaskTo(dt, d, hn::Eq(w, hn::Set(d, 1))), bc, code);
-    return hn::IfThenElse(hn::DemoteMaskTo(dt, d, hn::Eq(w, zero)), ac, code);
+    if constexpr (operation == CP_MIX)
+      code = hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, hn::Set(d, 1))), bc, code);
+    return hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, zero)), ac, code);
   };
   for (int y = r.first; y < r.first + r.count; ++y) {
     const auto* ap = reinterpret_cast<const T*>(address(a, 0, y));
@@ -234,25 +256,30 @@ int IntegerMixRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
 
 // Common float blends retain the scalar double evaluation order. Layout and
 // operation dispatch happen before the row loop, not once per vector.
-template <bool product, bool masked>
+template <int operation, bool masked>
 int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
                    cp_plane output, cp_rows r) {
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
   const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, c->opacity);
+  const auto neutral = hn::Set(d, c->neutral);
   const auto blend = [&](auto af, auto bf, auto mf) HWY_ATTR {
     const auto av = hn::PromoteTo(d, af), bv = hn::PromoteTo(d, bf);
     const auto w = masked ? hn::Mul(opacity, hn::PromoteTo(d, mf)) : opacity;
-    const auto target = product ? hn::Mul(av, bv) : bv;
+    auto target = bv;
+    if constexpr (operation == CP_PRODUCT)
+      target = hn::Mul(av, bv);
+    else if constexpr (operation == CP_GUIDED_MULTIPLY)
+      target = hn::Add(neutral, hn::Mul(hn::Sub(av, neutral), bv));
     // Unmasked MIX copy endpoints were already handled by Plane.
-    if constexpr (!product && !masked) {
+    if constexpr (operation == CP_MIX && !masked) {
       return hn::DemoteTo(df, hn::Add(av, hn::Mul(hn::Sub(bv, av), opacity)));
     } else {
       auto v = hn::DemoteTo(df, hn::IfThenElse(hn::Eq(w, one), target, hn::Add(av, hn::Mul(hn::Sub(target, av), w))));
-      if constexpr (!product)
-        v = hn::IfThenElse(hn::DemoteMaskTo(df, d, hn::Eq(w, one)), bf, v);
-      return hn::IfThenElse(hn::DemoteMaskTo(df, d, hn::Eq(w, zero)), af, v);
+      if constexpr (operation == CP_MIX)
+        v = hn::IfThenElse(NarrowMask(df, d, hn::Eq(w, one)), bf, v);
+      return hn::IfThenElse(NarrowMask(df, d, hn::Eq(w, zero)), af, v);
     }
   };
   for (int y = r.first; y < r.first + r.count; ++y) {
@@ -347,10 +374,10 @@ int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cons
         auto value = hn::DemoteTo(df, result);
         // Keep source bits for exact copy endpoints (including NaN payloads).
         if (c->operation == CP_MIX || select)
-          value = hn::IfThenElse(hn::DemoteMaskTo(df, d, hn::Eq(w, one)), LoadChannel(df, b, static_cast<int>(x), y, n),
-                                 value);
-        value = hn::IfThenElse(hn::DemoteMaskTo(df, d, hn::Eq(w, zero)), LoadChannel(df, a, static_cast<int>(x), y, n),
-                               value);
+          value =
+              hn::IfThenElse(NarrowMask(df, d, hn::Eq(w, one)), LoadChannel(df, b, static_cast<int>(x), y, n), value);
+        value =
+            hn::IfThenElse(NarrowMask(df, d, hn::Eq(w, zero)), LoadChannel(df, a, static_cast<int>(x), y, n), value);
         StoreChannel(value, df, output, static_cast<int>(x), y, n);
       } else {
         result = hn::IfThenElse(hn::IsNaN(result), zero, hn::Min(max, hn::Max(zero, result)));
@@ -426,18 +453,31 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
       a.step == bytes(c->format) && b.step == bytes(c->format) && output.step == bytes(c->format) &&
       (!mask || mask->step == bytes(c->format))) {
     if (c->format.storage == CP_U8)
-      return mask ? IntegerMixRows<uint8_t, true>(c, a, b, mask, output, r)
-                  : IntegerMixRows<uint8_t, false>(c, a, b, mask, output, r);
-    return mask ? IntegerMixRows<uint16_t, true>(c, a, b, mask, output, r)
-                : IntegerMixRows<uint16_t, false>(c, a, b, mask, output, r);
+      return mask ? IntegerBlendRows<uint8_t, CP_MIX, true>(c, a, b, mask, output, r)
+                  : IntegerBlendRows<uint8_t, CP_MIX, false>(c, a, b, mask, output, r);
+    return mask ? IntegerBlendRows<uint16_t, CP_MIX, true>(c, a, b, mask, output, r)
+                : IntegerBlendRows<uint16_t, CP_MIX, false>(c, a, b, mask, output, r);
   }
+  if (c->format.storage != CP_F32 && c->operation == CP_GUIDED_MULTIPLY && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
+      a.step == bytes(c->format) && gb->step == bytes(c->format) && output.step == bytes(c->format) &&
+      (!mask || mask->step == bytes(c->format))) {
+    if (c->format.storage == CP_U8)
+      return mask ? IntegerBlendRows<uint8_t, CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
+                  : IntegerBlendRows<uint8_t, CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+    return mask ? IntegerBlendRows<uint16_t, CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
+                : IntegerBlendRows<uint16_t, CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+  }
+  if (c->format.storage == CP_F32 && c->operation == CP_GUIDED_MULTIPLY && a.step == 4 && gb->step == 4 &&
+      output.step == 4 && (!mask || mask->step == 4))
+    return mask ? FloatBlendRows<CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
+                : FloatBlendRows<CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
   if (c->format.storage == CP_F32 && a.step == 4 && b.step == 4 && output.step == 4 && (!mask || mask->step == 4)) {
     if (c->operation == CP_MIX)
-      return mask ? FloatBlendRows<false, true>(c, a, b, mask, output, r)
-                  : FloatBlendRows<false, false>(c, a, b, mask, output, r);
+      return mask ? FloatBlendRows<CP_MIX, true>(c, a, b, mask, output, r)
+                  : FloatBlendRows<CP_MIX, false>(c, a, b, mask, output, r);
     if (c->operation == CP_PRODUCT)
-      return mask ? FloatBlendRows<true, true>(c, a, b, mask, output, r)
-                  : FloatBlendRows<true, false>(c, a, b, mask, output, r);
+      return mask ? FloatBlendRows<CP_PRODUCT, true>(c, a, b, mask, output, r)
+                  : FloatBlendRows<CP_PRODUCT, false>(c, a, b, mask, output, r);
   }
   if (c->format.storage == CP_U8)
     return PlaneRows<uint8_t>(c, a, b, mask, ga, gb, output, r);
@@ -451,30 +491,50 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
 template <class T>
 void CompatRows(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output, cp_rows r,
                 int opacity) {
-  const hn::ScalableTag<uint32_t> d;
+  // An 8-bit weighted sum, including rounding, is at most 65408.
+  // Narrow accumulators therefore double the number of exact byte results.
+  using Acc = std::conditional_t<std::is_same<T, uint8_t>::value, uint16_t, uint32_t>;
+  const hn::ScalableTag<Acc> d;
   const hn::Rebind<T, decltype(d)> dt;
-  const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const uint32_t scale = 1u << f.bits;
-  const auto vs = hn::Set(d, scale), vo = hn::Set(d, static_cast<uint32_t>(opacity));
+  const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
+  const Acc scale = static_cast<Acc>(1u << f.bits);
+  const auto vs = hn::Set(d, scale), vo = hn::Set(d, static_cast<Acc>(opacity));
+  const bool contiguous =
+      a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T) && (!mask || mask->step == sizeof(T));
+  const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
+    const auto av = hn::PromoteTo(d, ac), bv = hn::PromoteTo(d, bc);
+    auto result = hn::Zero(d);
+    if (!mask) {
+      result = hn::ShiftRight<8>(
+          hn::Add(hn::Add(hn::Mul(av, hn::Set(d, static_cast<Acc>(256 - opacity))), hn::Mul(bv, vo)), hn::Set(d, 128)));
+    } else {
+      const auto mv = hn::PromoteTo(d, mc);
+      const auto weight = opacity == 256 ? mv : hn::ShiftRight<8>(hn::Mul(mv, vo));
+      // The 16-bit maximum is 65535*65536+32768, which fits uint32_t.
+      result = hn::ShiftRightSame(
+          hn::Add(hn::Add(hn::Mul(av, hn::Sub(vs, weight)), hn::Mul(bv, weight)), hn::Set(d, scale / 2)), f.bits);
+      if (opacity == 256)
+        result = hn::IfThenElse(hn::Eq(mv, hn::Set(d, scale - 1)), bv, result);
+    }
+    return hn::DemoteTo(dt, result);
+  };
   for (int y = r.first; y < r.first + r.count; ++y) {
-    for (size_t x = 0; x < width; x += n) {
+    size_t x = 0;
+    if (contiguous) {
+      const auto* ap = reinterpret_cast<const T*>(address(a, 0, y));
+      const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
+      const auto* mp = mask ? reinterpret_cast<const T*>(address(*mask, 0, y)) : nullptr;
+      auto* dst = reinterpret_cast<T*>(address(output, 0, y));
+      for (; x < end; x += n)
+        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), mask ? hn::LoadU(dt, mp + x) : hn::Zero(dt)), dt,
+                   dst + x);
+    }
+    for (; x < width; x += n) {
       const size_t count = std::min(n, width - x);
-      const auto av = hn::PromoteTo(d, LoadChannel(dt, a, static_cast<int>(x), y, count));
-      const auto bv = hn::PromoteTo(d, LoadChannel(dt, b, static_cast<int>(x), y, count));
-      auto result = hn::Zero(d);
-      if (!mask) {
-        result = hn::ShiftRight<8>(
-            hn::Add(hn::Add(hn::Mul(av, hn::Set(d, 256 - opacity)), hn::Mul(bv, vo)), hn::Set(d, 128)));
-      } else {
-        const auto mv = hn::PromoteTo(d, LoadChannel(dt, *mask, static_cast<int>(x), y, count));
-        const auto weight = opacity == 256 ? mv : hn::ShiftRight<8>(hn::Mul(mv, vo));
-        // Maximum sum is 65535*65536+32768, which fits uint32_t.
-        result = hn::ShiftRightSame(
-            hn::Add(hn::Add(hn::Mul(av, hn::Sub(vs, weight)), hn::Mul(bv, weight)), hn::Set(d, scale / 2)), f.bits);
-        if (opacity == 256)
-          result = hn::IfThenElse(hn::Eq(mv, hn::Set(d, scale - 1)), bv, result);
-      }
-      StoreChannel(hn::DemoteTo(dt, result), dt, output, static_cast<int>(x), y, count);
+      StoreChannel(blend(LoadChannel(dt, a, static_cast<int>(x), y, count),
+                         LoadChannel(dt, b, static_cast<int>(x), y, count),
+                         mask ? LoadChannel(dt, *mask, static_cast<int>(x), y, count) : hn::Zero(dt)),
+                   dt, output, static_cast<int>(x), y, count);
     }
   }
 }
@@ -520,6 +580,13 @@ int Copy(cp_format f, cp_const_plane source, cp_plane output, cp_rows r) {
     return CP_OK;
   if (!plane_ok(source, r, bytes) || !plane_ok(output, r, bytes))
     return CP_INVALID_ARGUMENT;
+  if (source.data == output.data && source.stride == output.stride && source.step == output.step)
+    return CP_OK;
+  if (source.step == bytes && output.step == bytes) {
+    for (int y = r.first; y < r.first + r.count; ++y)
+      std::memcpy(address(output, 0, y), address(source, 0, y), size_t(r.width) * bytes);
+    return CP_OK;
+  }
   if (f.storage == CP_U8)
     CopyRows<uint8_t>(source, output, r);
   else if (f.storage == CP_U16)
