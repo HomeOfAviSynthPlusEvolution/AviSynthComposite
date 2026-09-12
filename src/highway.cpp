@@ -409,7 +409,7 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const double opacity_value = c->opacity, neutral_value = c->neutral, bias_value = c->bias;
+  const double opacity_value = c->opacity, neutral_value = c->neutral, bias_value = c->bias, inversion_value = c->inversion_sum;
   const auto blend = [&](auto af, auto bf, auto mf) HWY_ATTR {
     const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, opacity_value);
     const auto neutral = hn::Set(d, neutral_value);
@@ -418,6 +418,8 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     auto target = bv;
     if constexpr (operation == CP_PRODUCT)
       target = hn::Mul(av, bv);
+    else if constexpr (operation == CP_INVERT_MIX)
+      target = hn::Sub(hn::Set(d, inversion_value), bv);
     else if constexpr (operation == CP_SUBTRACT)
       target = hn::Sub(av, bv);
     else if constexpr (operation == CP_ADD)
@@ -718,6 +720,13 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
       output.step == 4 && (!mask || mask->step == 4))
     return mask ? FloatBlendRows<CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
                 : FloatBlendRows<CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+  if (c->format.storage == CP_F32 && c->operation == CP_INVERT_MIX) {
+    if (a.step == 4 && b.step == 4 && output.step == 4 && (!mask || mask->step == 4))
+      return mask ? FloatBlendRows<CP_INVERT_MIX, true>(c, a, b, mask, output, r)
+                  : FloatBlendRows<CP_INVERT_MIX, false>(c, a, b, nullptr, output, r);
+    // Keep the established stepped memory loop, specializing only its operation.
+    return PlaneRows<float, CP_INVERT_MIX>(c, a, b, mask, ga, gb, output, r);
+  }
   if (c->format.storage == CP_F32 && c->operation == CP_SUBTRACT) {
     if (a.step == 4 && b.step == 4 && output.step == 4 && (!mask || mask->step == 4))
       return mask ? FloatBlendRows<CP_SUBTRACT, true>(c, a, b, mask, output, r)
