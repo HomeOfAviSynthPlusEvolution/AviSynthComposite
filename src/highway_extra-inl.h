@@ -466,7 +466,7 @@ void MultiplyYuvInteger16(const cp_yuv_config* c, cp_const_yuv base, cp_const_yu
   MultiplyYuvTail(c, base, source, masks, output, r, end);
 }
 
-template <class T, bool masked>
+template <class T, bool masked, bool interior = false>
 void MultiplyYuvRows(const cp_yuv_config*, cp_const_yuv, cp_const_yuv, const cp_const_yuv*, cp_yuv, cp_rows);
 
 template <class T>
@@ -622,7 +622,7 @@ HWY_NOINLINE void YuvStepped(const cp_yuv_config* c, cp_const_yuv base, cp_const
 
 // Fused Overlay Multiply: share the source luma guide and load all channels
 // before writing any channel. Evaluation remains identical to the plane API.
-template <class T, bool masked>
+template <class T, bool masked, bool interior>
 void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source, const cp_const_yuv* masks,
                      cp_yuv output, cp_rows r) {
   const hn::ScalableTag<double> d;
@@ -729,7 +729,7 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
       // MSVC can treat decltype of a reference-captured tag as a reference here.
       // Name the tag type directly so VFromD always receives a value type.
       hn::VFromD<SampleTag> values_0, values_1, values_2;
-      for (int p = 0; p < 3; ++p) {
+      const auto channel = [&](int p) HWY_ATTR {
         const auto original = load(a[p], ap[p]);
         const auto av = promote(original);
         const auto neutral = hn::Set(d, p == 0 || std::is_same<T, float>::value ? 0 : (maximum + 1) / 2);
@@ -741,6 +741,9 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
           // the original sample bits below.
           target = hn::IfThenElse(hn::Eq(target, zero), zero, target);
         auto result = Mix(d, av, target, w);
+        if constexpr (interior)
+          // Only this specialization has 0 < opacity < 1 and no mask.
+          result = hn::Add(av, hn::Mul(hn::Sub(target, av), opacity));
         if constexpr (std::is_same<T, float>::value)
           VectorChannel(values_0, values_1, values_2, p) = hn::DemoteTo(dt, result);
         else {
@@ -748,8 +751,17 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
           VectorChannel(values_0, values_1, values_2, p) =
               hn::DemoteTo(dt, hn::DemoteInRangeTo(di, hn::Add(result, hn::Set(d, .5))));
         }
-        VectorChannel(values_0, values_1, values_2, p) = hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, zero)), original,
+        if constexpr (!interior)
+          VectorChannel(values_0, values_1, values_2, p) = hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, zero)), original,
                                                                         VectorChannel(values_0, values_1, values_2, p));
+      };
+      if constexpr (interior) {
+        channel(0);
+        channel(1);
+        channel(2);
+      } else {
+        for (int p = 0; p < 3; ++p)
+          channel(p);
       }
       for (int p = 0; p < 3; ++p) {
         if constexpr (decltype(direct)::value)
@@ -1050,6 +1062,12 @@ int Yuv(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b, const cp_const_y
     return CP_INVALID_ARGUMENT;
 #if HWY_HAVE_FLOAT64
   if (c->operation == CP_YUV_MULTIPLY) {
+    if (c->format.storage == CP_F32 && !m && c->opacity > 0 && c->opacity < 1 &&
+        a.y.step == 4 && a.u.step == 4 && a.v.step == 4 && b.y.step == 4 &&
+        out.y.step == 4 && out.u.step == 4 && out.v.step == 4) {
+      MultiplyYuvRows<float, false, true>(c, a, b, nullptr, out, r);
+      return CP_OK;
+    }
     if (c->format.storage == CP_U8) {
       if (m)
         MultiplyYuvRows<uint8_t, true>(c, a, b, m, out, r);
