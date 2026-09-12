@@ -138,7 +138,7 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
               c.threshold = bits == 32 ? double(std::numeric_limits<float>::epsilon() / 2) : 7;
             CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pd, rows) == CP_OK);
             CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pe, rows) == CP_OK);
-            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX) &&
+            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT) &&
                 rule == CP_WEIGHT_CONTINUOUS && opacity != 0) {
               for (int y = rows.first; y < rows.first + rows.count; ++y)
                 for (int x = 0; x < width; ++x) {
@@ -262,8 +262,8 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   const auto check = [&]() {
     CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {expected.data(), pitch, sizeof(T)}, rows) == CP_OK);
     CHECK(k->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
-    if (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
-        c.inversion_sum == std::floor(c.inversion_sum)) {
+    if (c.operation == CP_PRODUCT || (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
+        c.inversion_sum == std::floor(c.inversion_sum))) {
       for (int i = 0; i < count; ++i)
         CHECK(std::abs(int(got[i]) - int(expected[i])) <= 1);
     } else {
@@ -272,7 +272,7 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   };
   for (int operation : {CP_PRODUCT, CP_ADD, CP_SUBTRACT}) {
     c.operation = operation;
-    for (double opacity : {1. / 32768, std::nextafter(.5, 0.), .5, .625, std::nextafter(.625, 1.), 32767. / 32768}) {
+    for (double opacity : {.17, 1. / 32768, std::nextafter(.5, 0.), .5, .625, std::nextafter(.625, 1.), 32767. / 32768}) {
       c.opacity = opacity;
       check();
     }
@@ -360,7 +360,7 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
   const ptrdiff_t pitch = count * sizeof(T);
   const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
   const cp_rows rows{count, 1, 0, 1};
-  for (int op : {CP_MIX, CP_INVERT_MIX})
+  for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT})
     for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
       for (bool noncanonical : {false, true}) {
         // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
@@ -379,6 +379,8 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
           for (int i = 0; i < count; ++i) {
             const bool exact = opacity == 0 || m[i] == 0 || (opacity == 1 && m[i] == max) ||
                                 a[i] > max || b[i] > max || m[i] > max;
+            if (std::abs(int(got[i]) - int(ref[i])) > (exact ? 0 : 1))
+              std::fprintf(stderr, "quantized op=%d bits=%d opacity=%.17g alias=%d i=%d a=%u b=%u m=%u got=%u ref=%u\n", op, bits, opacity, alias, i, unsigned(a[i]), unsigned(b[i]), unsigned(m[i]), unsigned(got[i]), unsigned(ref[i]));
             CHECK(std::abs(int(got[i]) - int(ref[i])) <= (exact ? 0 : 1));
           }
         }
@@ -424,6 +426,7 @@ int main() {
         }
     U8MaskedMixRounding(table);
     U8MaskedMixRounding(table, CP_INVERT_MIX);
+    U8MaskedMixRounding(table, CP_PRODUCT);
     QuantizedMasked<uint8_t>(table, 8);
     for (int bits = 9; bits <= 16; ++bits)
       QuantizedMasked<uint16_t>(table, bits);

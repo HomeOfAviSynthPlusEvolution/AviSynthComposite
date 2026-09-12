@@ -49,8 +49,10 @@ typedef struct cp_plane_config {
 // remain exact. Unmasked integer continuous CP_INVERT_MIX may similarly use
 // Q16 for integral inversion_sum in [0,65535], with at most 1 LSB error.
 // Masked integer continuous MIX and INVERT_MIX (inversion_sum == maximum)
-// may round the combined effective weight to Q16, also within 1 LSB. Mask
-// zero and exact full-weight endpoints remain exact. Noncanonical narrow-U16
+// may round the combined effective weight to Q16, also within 1 LSB.
+// Integer continuous PRODUCT may also quantize the blend weight to Q16
+// within 1 LSB, preserving product floor before blending.
+// Mask zero and exact full-weight endpoints remain exact. Noncanonical narrow-U16
 // samples/masks retain scalar evaluation rather than changing extrapolation.
 // This tolerance does not apply to CODE, other operations, or F32.
 // Repeated calls can accumulate error; use CP_TARGET_C / this function

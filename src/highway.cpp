@@ -199,6 +199,61 @@ HWY_NOINLINE int MaskedContinuousRows(const cp_plane_config* c, cp_const_plane a
   return CP_OK;
 }
 
+// Preserve the floored product before quantizing the continuous blend weight.
+template <class T, bool masked>
+HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
+                                     cp_const_plane mask, cp_plane output, cp_rows r) {
+  const hn::ScalableTag<uint32_t> d;
+  const hn::Rebind<T, decltype(d)> dt;
+  const hn::Rebind<float, decltype(d)> df;
+  const hn::Rebind<int32_t, decltype(d)> di;
+  const uint32_t maximum_code = static_cast<uint32_t>(maximum(c->format));
+  const float factor = static_cast<float>(c->opacity * 65536 / maximum_code);
+  const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
+  const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
+                          (!masked || mask.step == sizeof(T)) && output.step == sizeof(T);
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+      const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
+      auto bv = hn::PromoteTo(d, bc);
+      const auto max = hn::Set(d, maximum_code);
+      if constexpr (sizeof(T) == 2) {
+        // The ABI permits noncanonical narrow-U16 samples, including masks
+        // above maximum which extrapolate. Keep their reference arithmetic.
+        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
+          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
+          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
+          const cp_const_plane mp = masked ? cp_const_plane{address(mask, int(x), y), mask.stride, mask.step} : cp_const_plane{};
+          const cp_plane op{address(output, int(x), y), output.stride, output.step};
+          cp_process_plane(c, ap, bp, masked ? &mp : nullptr, nullptr, nullptr, op, {int(count), 1, 0, 1});
+          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
+        }
+      }
+      bv = DivideCode(d, hn::Mul(av, bv), c->format.bits);
+      const auto scaled = hn::Mul(hn::ConvertTo(df, mv), hn::Set(df, factor));
+      const auto weight = hn::BitCast(d, hn::ConvertTo(di, hn::Add(scaled, hn::Set(df, .5f))));
+      const auto sum = hn::Add(hn::Add(hn::Mul(av, hn::Sub(hn::Set(d, 65536), weight)), hn::Mul(bv, weight)),
+                               hn::Set(d, 32768));
+      return hn::DemoteTo(dt, hn::ShiftRight<16>(sum));
+    };
+    size_t x = 0;
+    if (contiguous) {
+      const auto* ap = reinterpret_cast<const T*>(address(a, 0, y));
+      const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
+      const auto* mp = masked ? reinterpret_cast<const T*>(address(mask, 0, y)) : nullptr;
+      auto* dst = reinterpret_cast<T*>(address(output, 0, y));
+      for (; x < end; x += n)
+        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Set(dt, T(maximum_code)), x, n), dt, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      StoreChannel(blend(LoadChannel(dt, a, int(x), y, count), LoadChannel(dt, b, int(x), y, count),
+                           masked ? LoadChannel(dt, mask, int(x), y, count) : hn::Set(dt, T(maximum_code)), x, count), dt, output, int(x), y, count);
+    }
+  }
+  return CP_OK;
+}
+
 template <class T, bool product, bool masked, bool guided = false>
 int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output,
              cp_rows r) {
@@ -595,6 +650,14 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     // values bounded. Fractional or larger offsets retain binary64 evaluation.
     if (offset >= 0 && offset <= 65536 && offset == std::floor(offset))
       return OffsetPlaneRows(c, a, b, output, r, static_cast<uint32_t>(weight32768), static_cast<uint32_t>(offset));
+  }
+  if (c->operation == CP_PRODUCT && c->format.storage != CP_F32 &&
+      c->weight_rule == CP_WEIGHT_CONTINUOUS) {
+    if (c->format.storage == CP_U8)
+      return mask ? ProductContinuousRows<uint8_t, true>(c, a, b, *mask, output, r)
+                  : ProductContinuousRows<uint8_t, false>(c, a, b, {}, output, r);
+    return mask ? ProductContinuousRows<uint16_t, true>(c, a, b, *mask, output, r)
+                : ProductContinuousRows<uint16_t, false>(c, a, b, {}, output, r);
   }
   if (mask && c->format.storage != CP_F32 && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
       (c->operation == CP_MIX || (c->operation == CP_INVERT_MIX && c->inversion_sum == maximum(c->format)))) {
