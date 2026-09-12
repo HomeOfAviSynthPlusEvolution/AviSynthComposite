@@ -418,6 +418,8 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     auto target = bv;
     if constexpr (operation == CP_PRODUCT)
       target = hn::Mul(av, bv);
+    else if constexpr (operation == CP_ADD)
+      target = hn::Add(av, bv);
     else if constexpr (operation == CP_DIFFERENCE)
       target = hn::Add(hn::Sub(av, bv), hn::Set(d, bias_value));
     else if constexpr (operation == CP_GUIDED_MULTIPLY)
@@ -713,6 +715,10 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
       output.step == 4 && (!mask || mask->step == 4))
     return mask ? FloatBlendRows<CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
                 : FloatBlendRows<CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+  if (c->format.storage == CP_F32 && c->operation == CP_ADD && a.step == 4 && b.step == 4 &&
+      output.step == 4 && (!mask || mask->step == 4))
+    return mask ? FloatBlendRows<CP_ADD, true>(c, a, b, mask, output, r)
+                : FloatBlendRows<CP_ADD, false>(c, a, b, nullptr, output, r);
   if (c->format.storage == CP_F32 && c->operation == CP_DIFFERENCE && a.step == 4 && b.step == 4 &&
       output.step == 4 && (!mask || mask->step == 4))
     return mask ? FloatBlendRows<CP_DIFFERENCE, true>(c, a, b, mask, output, r)
