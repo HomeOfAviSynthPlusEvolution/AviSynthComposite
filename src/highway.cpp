@@ -254,7 +254,7 @@ HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane 
   return CP_OK;
 }
 
-template <class T, bool product, bool masked, bool guided = false>
+template <class T, bool product, bool masked, bool guided = false, int fixed_bits = 0>
 int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output,
              cp_rows r) {
   // 8-bit sums including the exact division correction fit in uint16_t.
@@ -263,7 +263,7 @@ int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const
   const hn::ScalableTag<Acc> d;
   const hn::Rebind<T, decltype(d)> dt;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
-  const int bits = sizeof(T) == 1 ? 8 : c->format.bits;
+  const int bits = sizeof(T) == 1 ? 8 : fixed_bits ? fixed_bits : c->format.bits;
   const uint32_t maximum = (1u << bits) - 1;
   const Acc level_value = static_cast<Acc>(std::floor(c->opacity * maximum + .5));
   const bool contiguous =
@@ -296,9 +296,25 @@ int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const
       const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
       const auto* mp = masked ? reinterpret_cast<const T*>(address(*mask, 0, y)) : nullptr;
       auto* dst = reinterpret_cast<T*>(address(output, 0, y));
+      if constexpr (sizeof(T) == 1 && !guided) {
+        for (; x + 2 * n <= end; x += 2 * n) {
+          const auto first = blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x),
+                                   masked ? hn::LoadU(dt, mp + x) : hn::Zero(dt));
+          const auto second = blend(hn::LoadU(dt, ap + x + n), hn::LoadU(dt, bp + x + n),
+                                    masked ? hn::LoadU(dt, mp + x + n) : hn::Zero(dt));
+          hn::StoreU(first, dt, dst + x);
+          hn::StoreU(second, dt, dst + x + n);
+        }
+      }
       for (; x < end; x += n)
         hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Zero(dt)),
                    dt, dst + x);
+    }
+    if constexpr (sizeof(T) == 1 && !guided) {
+      for (; x + n <= width; x += n)
+        StoreChannel(blend(LoadChannel(dt, a, int(x), y, n), LoadChannel(dt, b, int(x), y, n),
+                           masked ? LoadChannel(dt, *mask, int(x), y, n) : hn::Zero(dt)),
+                     dt, output, int(x), y, n);
     }
     for (; x < width; x += n) {
       const size_t count = std::min(n, width - x);
@@ -310,14 +326,20 @@ int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const
   }
   return CP_OK;
 }
-template <class T>
+template <class T, int fixed_bits = 0>
 int CodePlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
                   cp_plane output, cp_rows r) {
+  if constexpr (sizeof(T) == 2 && fixed_bits == 0) {
+    if (c->format.bits == 10)
+      return CodePlaneRows<T, 10>(c, a, b, mask, output, r);
+    if (c->format.bits == 16)
+      return CodePlaneRows<T, 16>(c, a, b, mask, output, r);
+  }
   if (c->operation == CP_PRODUCT)
-    return mask ? CodeRows<T, true, true>(c, a, b, mask, output, r)
-                : CodeRows<T, true, false>(c, a, b, mask, output, r);
-  return mask ? CodeRows<T, false, true>(c, a, b, mask, output, r)
-              : CodeRows<T, false, false>(c, a, b, mask, output, r);
+    return mask ? CodeRows<T, true, true, false, fixed_bits>(c, a, b, mask, output, r)
+                : CodeRows<T, true, false, false, fixed_bits>(c, a, b, mask, output, r);
+  return mask ? CodeRows<T, false, true, false, fixed_bits>(c, a, b, mask, output, r)
+              : CodeRows<T, false, false, false, fixed_bits>(c, a, b, mask, output, r);
 }
 
 #if HWY_HAVE_FLOAT64
