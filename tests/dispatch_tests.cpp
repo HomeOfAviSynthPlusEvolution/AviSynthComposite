@@ -138,7 +138,7 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
               c.threshold = bits == 32 ? double(std::numeric_limits<float>::epsilon() / 2) : 7;
             CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pd, rows) == CP_OK);
             CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pe, rows) == CP_OK);
-            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT) &&
+            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT || op == CP_ADD || op == CP_SUBTRACT) &&
                 rule == CP_WEIGHT_CONTINUOUS && opacity != 0) {
               for (int y = rows.first; y < rows.first + rows.count; ++y)
                 for (int x = 0; x < width; ++x) {
@@ -262,7 +262,7 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   const auto check = [&]() {
     CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {expected.data(), pitch, sizeof(T)}, rows) == CP_OK);
     CHECK(k->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
-    if (c.operation == CP_PRODUCT || (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
+    if (c.operation == CP_PRODUCT || c.operation == CP_ADD || c.operation == CP_SUBTRACT || (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
         c.inversion_sum == std::floor(c.inversion_sum))) {
       for (int i = 0; i < count; ++i)
         CHECK(std::abs(int(got[i]) - int(expected[i])) <= 1);
@@ -360,7 +360,7 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
   const ptrdiff_t pitch = count * sizeof(T);
   const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
   const cp_rows rows{count, 1, 0, 1};
-  for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT})
+  for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT, CP_ADD, CP_SUBTRACT})
     for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
       for (bool noncanonical : {false, true}) {
         // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
@@ -427,6 +427,8 @@ int main() {
     U8MaskedMixRounding(table);
     U8MaskedMixRounding(table, CP_INVERT_MIX);
     U8MaskedMixRounding(table, CP_PRODUCT);
+    U8MaskedMixRounding(table, CP_ADD);
+    U8MaskedMixRounding(table, CP_SUBTRACT);
     QuantizedMasked<uint8_t>(table, 8);
     for (int bits = 9; bits <= 16; ++bits)
       QuantizedMasked<uint16_t>(table, bits);

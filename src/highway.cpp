@@ -254,6 +254,72 @@ HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane 
   return CP_OK;
 }
 
+// Quantize bounded affine deltas once; clip only the final sample.
+template <class T, bool masked, int operation>
+HWY_NOINLINE int ArithmeticContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
+                                     cp_const_plane mask, cp_plane output, cp_rows r) {
+  const hn::ScalableTag<uint32_t> d;
+  const hn::Rebind<T, decltype(d)> dt;
+  const hn::Rebind<float, decltype(d)> df;
+  const hn::Rebind<int32_t, decltype(d)> di;
+  const uint32_t maximum_code = static_cast<uint32_t>(maximum(c->format));
+  const float factor = static_cast<float>(c->opacity * 65536 / maximum_code);
+  const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
+  const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
+                          (!masked || mask.step == sizeof(T)) && output.step == sizeof(T);
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+      const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
+      auto bv = hn::PromoteTo(d, bc);
+      const auto max = hn::Set(d, maximum_code);
+      if constexpr (sizeof(T) == 2) {
+        // The ABI permits noncanonical narrow-U16 samples, including masks
+        // above maximum which extrapolate. Keep their reference arithmetic.
+        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
+          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
+          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
+          const cp_const_plane mp = masked ? cp_const_plane{address(mask, int(x), y), mask.stride, mask.step} : cp_const_plane{};
+          const cp_plane op{address(output, int(x), y), output.stride, output.step};
+          cp_process_plane(c, ap, bp, masked ? &mp : nullptr, nullptr, nullptr, op, {int(count), 1, 0, 1});
+          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
+        }
+      }
+      auto negative = hn::Eq(hn::Zero(d), hn::Set(d, 1));
+      if constexpr (operation == CP_SUBTRACT)
+        negative = hn::Eq(hn::Zero(d), hn::Zero(d));
+      if constexpr (operation == CP_DIFFERENCE) {
+        const auto bias = hn::Set(d, static_cast<uint32_t>(c->bias));
+        negative = hn::Lt(bias, bv);
+        bv = hn::IfThenElse(negative, hn::Sub(bv, bias), hn::Sub(bias, bv));
+      }
+      const auto scaled = hn::Mul(hn::ConvertTo(df, mv), hn::Set(df, factor));
+      const auto weight = hn::BitCast(d, hn::ConvertTo(di, hn::Add(scaled, hn::Set(df, .5f))));
+      // A negative half tie rounds toward +infinity, so its magnitude
+      // rounds down. Both numerators fit uint32_t through 16 bits.
+      const auto rounding = hn::IfThenElse(negative, hn::Set(d, 32767), hn::Set(d, 32768));
+      const auto delta = hn::ShiftRight<16>(hn::Add(hn::Mul(bv, weight), rounding));
+      const auto lower = hn::IfThenElse(hn::Lt(av, delta), hn::Zero(d), hn::Sub(av, delta));
+      const auto upper = hn::Min(max, hn::Add(av, delta));
+      return hn::DemoteTo(dt, hn::IfThenElse(negative, lower, upper));
+    };
+    size_t x = 0;
+    if (contiguous) {
+      const auto* ap = reinterpret_cast<const T*>(address(a, 0, y));
+      const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
+      const auto* mp = masked ? reinterpret_cast<const T*>(address(mask, 0, y)) : nullptr;
+      auto* dst = reinterpret_cast<T*>(address(output, 0, y));
+      for (; x < end; x += n)
+        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Set(dt, T(maximum_code)), x, n), dt, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      StoreChannel(blend(LoadChannel(dt, a, int(x), y, count), LoadChannel(dt, b, int(x), y, count),
+                           masked ? LoadChannel(dt, mask, int(x), y, count) : hn::Set(dt, T(maximum_code)), x, count), dt, output, int(x), y, count);
+    }
+  }
+  return CP_OK;
+}
+
 template <class T, bool product, bool masked, bool guided = false, int fixed_bits = 0>
 int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output,
              cp_rows r) {
@@ -691,6 +757,21 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     // values bounded. Fractional or larger offsets retain binary64 evaluation.
     if (offset >= 0 && offset <= 65536 && offset == std::floor(offset))
       return OffsetPlaneRows(c, a, b, output, r, static_cast<uint32_t>(weight32768), static_cast<uint32_t>(offset));
+  }
+  if ((c->operation == CP_ADD || c->operation == CP_SUBTRACT) &&
+      c->format.storage != CP_F32 && c->weight_rule == CP_WEIGHT_CONTINUOUS) {
+    if (c->format.storage == CP_U8) {
+      if (c->operation == CP_ADD)
+        return mask ? ArithmeticContinuousRows<uint8_t, true, CP_ADD>(c, a, b, *mask, output, r)
+                    : ArithmeticContinuousRows<uint8_t, false, CP_ADD>(c, a, b, {}, output, r);
+      return mask ? ArithmeticContinuousRows<uint8_t, true, CP_SUBTRACT>(c, a, b, *mask, output, r)
+                  : ArithmeticContinuousRows<uint8_t, false, CP_SUBTRACT>(c, a, b, {}, output, r);
+    }
+    if (c->operation == CP_ADD)
+      return mask ? ArithmeticContinuousRows<uint16_t, true, CP_ADD>(c, a, b, *mask, output, r)
+                  : ArithmeticContinuousRows<uint16_t, false, CP_ADD>(c, a, b, {}, output, r);
+    return mask ? ArithmeticContinuousRows<uint16_t, true, CP_SUBTRACT>(c, a, b, *mask, output, r)
+                : ArithmeticContinuousRows<uint16_t, false, CP_SUBTRACT>(c, a, b, {}, output, r);
   }
   if (c->operation == CP_PRODUCT && c->format.storage != CP_F32 &&
       c->weight_rule == CP_WEIGHT_CONTINUOUS) {
