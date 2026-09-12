@@ -288,7 +288,7 @@ int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane 
 
 // Common float blends retain the scalar double evaluation order. Layout and
 // operation dispatch happen before the row loop, not once per vector.
-template <int operation, bool masked>
+template <int operation, bool masked, bool full_product = false>
 int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
                    cp_plane output, cp_rows r) {
   const hn::ScalableTag<double> d;
@@ -306,7 +306,13 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     else if constexpr (operation == CP_GUIDED_MULTIPLY)
       target = hn::Add(neutral, hn::Mul(hn::Sub(av, neutral), bv));
     // Unmasked MIX copy endpoints were already handled by Plane.
-    if constexpr (operation == CP_MIX && !masked) {
+    if constexpr (operation == CP_PRODUCT && !masked) {
+      // Plane handles zero opacity and dispatches the full-product endpoint.
+      // Keep invariant endpoint comparisons and selections out of the hot loop.
+      if constexpr (full_product)
+        return hn::DemoteTo(df, target);
+      return hn::DemoteTo(df, hn::Add(av, hn::Mul(hn::Sub(target, av), opacity)));
+    } else if constexpr (operation == CP_MIX && !masked) {
       return hn::DemoteTo(df, hn::Add(av, hn::Mul(hn::Sub(bv, av), opacity)));
     } else {
       auto v = hn::DemoteTo(df, hn::IfThenElse(hn::Eq(w, one), target, hn::Add(av, hn::Mul(hn::Sub(target, av), w))));
@@ -552,9 +558,12 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     if (c->operation == CP_MIX)
       return mask ? FloatBlendRows<CP_MIX, true>(c, a, b, mask, output, r)
                   : FloatBlendRows<CP_MIX, false>(c, a, b, mask, output, r);
-    if (c->operation == CP_PRODUCT)
-      return mask ? FloatBlendRows<CP_PRODUCT, true>(c, a, b, mask, output, r)
-                  : FloatBlendRows<CP_PRODUCT, false>(c, a, b, mask, output, r);
+    if (c->operation == CP_PRODUCT) {
+      if (mask)
+        return FloatBlendRows<CP_PRODUCT, true>(c, a, b, mask, output, r);
+      return c->opacity == 1 ? FloatBlendRows<CP_PRODUCT, false, true>(c, a, b, nullptr, output, r)
+                             : FloatBlendRows<CP_PRODUCT, false>(c, a, b, nullptr, output, r);
+    }
   }
   if (c->format.storage == CP_U8)
     return PlaneRows<uint8_t>(c, a, b, mask, ga, gb, output, r);
