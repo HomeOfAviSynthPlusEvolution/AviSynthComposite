@@ -191,7 +191,7 @@ static void FloatBlendSpecials(const cp_kernels* table) {
   }
   const cp_const_plane pa{a, n * 4, 4}, pb{b, n * 4, 4}, pm{m, n * 4, 4};
   for (int op : {CP_MIX, CP_PRODUCT, CP_GUIDED_MULTIPLY, CP_DIFFERENCE, CP_ADD, CP_SUBTRACT, CP_INVERT_MIX})
-    for (double neutral : {-0.0, .1, -1e300})
+    for (double neutral : {-0.0, 0.0, .1, .5, -1e300})
       for (double opacity : {0.0, .17, .625, 1.0})
         for (bool masked : {false, true}) {
           const cp_plane_config c{{CP_F32, 32}, op, opacity, neutral, neutral, neutral, 0, 0, CP_WEIGHT_CONTINUOUS};

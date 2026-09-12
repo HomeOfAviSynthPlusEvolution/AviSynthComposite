@@ -425,13 +425,13 @@ int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane 
 
 // Common float blends retain the scalar double evaluation order. Layout and
 // operation dispatch happen before the row loop, not once per vector.
-template <int operation, bool masked, bool full_product = false>
+template <int operation, bool masked, bool full_product = false, int center_mode = 0>
 int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
                    cp_plane output, cp_rows r) {
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const double opacity_value = c->opacity, neutral_value = c->neutral, bias_value = c->bias, inversion_value = c->inversion_sum;
+  const double opacity_value = c->opacity, neutral_value = center_mode == 1 ? 0.0 : center_mode == 2 ? .5 : c->neutral, bias_value = c->bias, inversion_value = c->inversion_sum;
   const auto blend = [&](auto af, auto bf, auto mf) HWY_ATTR {
     const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, opacity_value);
     const auto neutral = hn::Set(d, neutral_value);
@@ -451,7 +451,7 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     else if constexpr (operation == CP_GUIDED_MULTIPLY)
       target = hn::Add(neutral, hn::Mul(hn::Sub(av, neutral), bv));
     // Unmasked MIX copy endpoints were already handled by Plane.
-    if constexpr (operation == CP_PRODUCT && !masked) {
+    if constexpr ((operation == CP_PRODUCT || operation == CP_GUIDED_MULTIPLY) && !masked) {
       // Plane handles zero opacity and dispatches the full-product endpoint.
       // Keep invariant endpoint comparisons and selections out of the hot loop.
       if constexpr (full_product)
@@ -484,6 +484,16 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     }
   }
   return CP_OK;
+}
+
+template <bool masked, int center_mode>
+int GuidedFloatRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane guide, const cp_const_plane* mask,
+                    cp_plane output, cp_rows r) {
+  if constexpr (!masked) {
+    if (c->opacity == 1)
+      return FloatBlendRows<CP_GUIDED_MULTIPLY, false, true, center_mode>(c, a, guide, nullptr, output, r);
+  }
+  return FloatBlendRows<CP_GUIDED_MULTIPLY, masked, false, center_mode>(c, a, guide, mask, output, r);
 }
 
 template <class T, int fixed_operation = -1>
@@ -738,10 +748,18 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     return mask ? IntegerBlendRows<uint16_t, CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
                 : IntegerBlendRows<uint16_t, CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
   }
-  if (c->format.storage == CP_F32 && c->operation == CP_GUIDED_MULTIPLY && a.step == 4 && gb->step == 4 &&
-      output.step == 4 && (!mask || mask->step == 4))
-    return mask ? FloatBlendRows<CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
-                : FloatBlendRows<CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+  if (c->format.storage == CP_F32 && c->operation == CP_GUIDED_MULTIPLY) {
+    if (a.step != 4 || gb->step != 4 || output.step != 4 || (mask && mask->step != 4))
+      return PlaneRows<float, CP_GUIDED_MULTIPLY>(c, a, b, mask, ga, gb, output, r);
+    if (c->neutral == 0 && !std::signbit(c->neutral))
+      return mask ? GuidedFloatRows<true, 1>(c, a, *gb, mask, output, r)
+                  : GuidedFloatRows<false, 1>(c, a, *gb, nullptr, output, r);
+    if (c->neutral == .5)
+      return mask ? GuidedFloatRows<true, 2>(c, a, *gb, mask, output, r)
+                  : GuidedFloatRows<false, 2>(c, a, *gb, nullptr, output, r);
+    return mask ? GuidedFloatRows<true, 0>(c, a, *gb, mask, output, r)
+                : GuidedFloatRows<false, 0>(c, a, *gb, nullptr, output, r);
+  }
   if (c->format.storage == CP_F32 && c->operation == CP_INVERT_MIX) {
     if (a.step == 4 && b.step == 4 && output.step == 4 && (!mask || mask->step == 4))
       return mask ? FloatBlendRows<CP_INVERT_MIX, true>(c, a, b, mask, output, r)
