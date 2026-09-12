@@ -222,6 +222,47 @@ void U8MaskedMixRounding(const cp_kernels* k) {
     }
   }
 }
+template <class T>
+void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
+  constexpr int count = 65541;
+  std::vector<T> a(count), b(count), got(count), expected(count);
+  for (int i = 0; i < count; ++i) {
+    a[i] = T(i);
+    b[i] = sizeof(T) == 1 ? T(i >> 8) : T(uint32_t(i) * 40503u + 19u);
+  }
+  const T maximum = std::numeric_limits<T>::max();
+  a[65536] = b[65536] = maximum;
+  a[65537] = maximum;
+  b[65537] = 0;
+  a[65538] = 0;
+  b[65538] = maximum;
+  a[65539] = maximum / 2;
+  b[65539] = maximum;
+  // Enumerate every U8 pair, or every U16 base code with a permuted source.
+  // Narrow U16 formats deliberately include noncanonical samples.
+  const ptrdiff_t pitch = count * ptrdiff_t(sizeof(T));
+  const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)};
+  const cp_rows rows{count, 1, 0, 1};
+  cp_plane_config c{};
+  c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
+  c.weight_rule = CP_WEIGHT_CONTINUOUS;
+  const auto check = [&]() {
+    CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {expected.data(), pitch, sizeof(T)}, rows) == CP_OK);
+    CHECK(k->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
+    CHECK(got == expected);
+  };
+  for (int operation : {CP_PRODUCT, CP_ADD, CP_SUBTRACT}) {
+    c.operation = operation;
+    for (double opacity : {1. / 32768, std::nextafter(.5, 0.), .5, .625, std::nextafter(.625, 1.), 32767. / 32768}) {
+      c.opacity = opacity;
+      check();
+    }
+    if (operation != CP_PRODUCT || bits == 8 || bits == 16) {
+      c.opacity = 1;
+      check();
+    }
+  }
+}
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -260,6 +301,9 @@ int main() {
           Arithmetic<float>(table, 32, width, step, negative);
         }
     U8MaskedMixRounding(table);
+    ContinuousIntegerRounding<uint8_t>(table, 8);
+    for (int bits = 9; bits <= 16; ++bits)
+      ContinuousIntegerRounding<uint16_t>(table, bits);
     FloatEndpoints(table);
     FloatBlendSpecials(table);
   }

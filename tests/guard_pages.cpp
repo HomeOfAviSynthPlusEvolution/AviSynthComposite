@@ -95,6 +95,10 @@ void run(const cp_kernels* k, int bits, int width, int step, bool negative) {
     cp_plane_config c = {f, op, .5, 0, double(max), 0, 0, 1, CP_WEIGHT_CODE};
     CHECK(k->process_plane(&c, av, bv, &mv, &av, &bv, ov, r) == CP_OK);
   }
+  for (int operation : {CP_PRODUCT, CP_ADD, CP_SUBTRACT}) {
+    const cp_plane_config arithmetic{f, operation, .625, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+    CHECK(k->process_plane(&arithmetic, av, bv, nullptr, nullptr, nullptr, ov, r) == CP_OK);
+  }
   CHECK(k->affine(f, av, ov, r, -1, max) == CP_OK);
   CHECK(k->clamp(f, av, ov, r, 0, max) == CP_OK);
   CHECK(k->rgb_luma(f, {av, bv, av}, ov, r, CP_LUMA_NEAREST) == CP_OK);

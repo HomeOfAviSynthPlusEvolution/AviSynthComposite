@@ -76,12 +76,31 @@ void run(int bits, int step) {
   source.randomize(rng, bits);
   const cp_rows rows{width, height, 0, height};
   const double maximum = bits == 32 ? 1.0 : double((1u << bits) - 1);
-  for (const std::string workload : {"mix",         "code_mix",  "code_guided",    "product",
-                                     "guided",      "compat",    "layer_add_rgb",  "layer_mul_rgb",
-                                     "overlay_mul", "sample420", "yuv_add",        "yuv_subtract",
-                                     "yuv_soft",    "yuv_hard",  "yuv_difference", "yuv_exclusion",
-                                     "luma",        "affine",    "clamp",          "copy",
-                                     "fill",        "key"}) {
+  for (const std::string workload : {"continuous_product",
+                                     "continuous_add",
+                                     "continuous_subtract",
+                                     "mix",
+                                     "code_mix",
+                                     "code_guided",
+                                     "product",
+                                     "guided",
+                                     "compat",
+                                     "layer_add_rgb",
+                                     "layer_mul_rgb",
+                                     "overlay_mul",
+                                     "sample420",
+                                     "yuv_add",
+                                     "yuv_subtract",
+                                     "yuv_soft",
+                                     "yuv_hard",
+                                     "yuv_difference",
+                                     "yuv_exclusion",
+                                     "luma",
+                                     "affine",
+                                     "clamp",
+                                     "copy",
+                                     "fill",
+                                     "key"}) {
     if (!filter.empty() && workload != filter)
       continue;
     if (bits == 32 && workload == "compat")
@@ -100,10 +119,12 @@ void run(int bits, int step) {
       const int channels = rgb || yuv || workload == "overlay_mul" ? 3 : 1;
       cp_plane_config c{};
       c.format = f;
-      c.operation = workload == "product" || workload == "layer_mul_rgb" ? CP_PRODUCT
-                    : (workload == "guided" || workload == "code_guided" || workload == "overlay_mul")
-                        ? CP_GUIDED_MULTIPLY
-                        : CP_MIX;
+      c.operation =
+          workload == "continuous_add"                                                               ? CP_ADD
+          : workload == "continuous_subtract"                                                        ? CP_SUBTRACT
+          : workload == "product" || workload == "continuous_product" || workload == "layer_mul_rgb" ? CP_PRODUCT
+          : (workload == "guided" || workload == "code_guided" || workload == "overlay_mul") ? CP_GUIDED_MULTIPLY
+                                                                                             : CP_MIX;
       c.opacity = blend_opacity;
       c.neutral = workload == "code_guided" ? (bits == 32 ? 0 : (maximum + 1) / 2) : maximum / 2;
       c.weight_rule = rgb || workload == "code_mix" || workload == "code_guided" || workload == "product"

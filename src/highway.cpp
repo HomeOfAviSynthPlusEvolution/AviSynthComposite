@@ -67,20 +67,49 @@ int AverageRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r) 
   return CP_OK;
 }
 
+// For M=2^bits-1 and 0<=v<=M*M+floor(M/2), floor(v/M) equals
+// (v+1+(v>>bits))>>bits. Write v=q*M+r: the inner shift is q-[r<q],
+// so the final numerator is q*2^bits+r+1-[r<q], whose remainder
+// is in [0, M]. At bits<=16 even the largest numerator fits uint32_t.
+// This avoids division and preserves every integer rounding boundary.
+template <class D>
+hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
+  return hn::ShiftRightSame(hn::Add(hn::Add(v, hn::Set(d, 1)), hn::ShiftRightSame(v, bits)), bits);
+}
+
 // Construct vector constants inside arithmetic lambdas from scalar values.
 // Captured vector wrappers can make MSVC spill/reassemble their halves in hot loops.
-// Exact dyadic weights need no floating-point arithmetic. The largest sum is
-// 65535*32768+16384, safely below UINT32_MAX. No opacity quantization occurs.
-template <class T>
-int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight) {
+// Exact dyadic weights need no floating-point arithmetic. Convex blends sum
+// to at most 65535*32768+16384; Add/Subtract bounds are documented below.
+// No opacity quantization occurs.
+template <class T, int operation = CP_MIX>
+int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
+                 uint32_t maximum_code = std::numeric_limits<T>::max()) {
   const hn::ScalableTag<uint32_t> d;
   const hn::Rebind<T, decltype(d)> dt;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T);
   const auto blend = [&](auto av, auto bv) HWY_ATTR {
     const auto w = hn::Set(d, weight), inv = hn::Set(d, 32768 - weight), round = hn::Set(d, 16384);
-    return hn::DemoteTo(dt, hn::ShiftRight<15>(hn::Add(
-                                hn::Add(hn::Mul(hn::PromoteTo(d, av), inv), hn::Mul(hn::PromoteTo(d, bv), w)), round)));
+    const auto base = hn::PromoteTo(d, av);
+    auto target = hn::PromoteTo(d, bv);
+    if constexpr (operation == CP_PRODUCT)
+      target = DivideCode(d, hn::Mul(base, target), sizeof(T) * 8);
+    if constexpr (operation == CP_SUBTRACT) {
+      const hn::Rebind<int32_t, hn::ScalableTag<uint32_t>> di;
+      // Both products are <= 65535*32768, so their signed difference and
+      // rounding addition fit int32_t, even for noncanonical U16 samples.
+      const auto sum =
+          hn::Add(hn::BitCast(di, hn::Sub(hn::ShiftLeft<15>(base), hn::Mul(target, w))), hn::Set(di, 16384));
+      const auto value = hn::Min(hn::Set(di, int32_t(maximum_code)), hn::Max(hn::Zero(di), hn::ShiftRight<15>(sum)));
+      return hn::DemoteTo(dt, value);
+    } else {
+      auto value = hn::ShiftRight<15>(hn::Add(
+          hn::Add(operation == CP_ADD ? hn::ShiftLeft<15>(base) : hn::Mul(base, inv), hn::Mul(target, w)), round));
+      if constexpr (operation == CP_ADD)
+        value = hn::Min(value, hn::Set(d, maximum_code));
+      return hn::DemoteTo(dt, value);
+    }
   };
   for (int y = r.first; y < r.first + r.count; ++y) {
     size_t x = 0;
@@ -99,16 +128,6 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
     }
   }
   return CP_OK;
-}
-
-// For M=2^bits-1 and 0<=v<=M*M+floor(M/2), floor(v/M) equals
-// (v+1+(v>>bits))>>bits. Write v=q*M+r: the inner shift is q-[r<q],
-// so the final numerator is q*2^bits+r+1-[r<q], whose remainder
-// is in [0, M]. At bits<=16 even the largest numerator fits uint32_t.
-// This avoids division and preserves every integer rounding boundary.
-template <class D>
-hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
-  return hn::ShiftRightSame(hn::Add(hn::Add(v, hn::Set(d, 1)), hn::ShiftRightSame(v, bits)), bits);
 }
 
 template <class T, bool product, bool masked, bool guided = false>
@@ -438,6 +457,30 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     if (c->format.storage == CP_U8)
       return WeightedRows<uint8_t>(a, b, output, r, static_cast<uint32_t>(weight32768));
     return WeightedRows<uint16_t>(a, b, output, r, static_cast<uint32_t>(weight32768));
+  }
+  // A floored integer product blended with an exact k/32768 weight is
+  // integral arithmetic. Full-range storage keeps both the product division
+  // and weighted sum within uint32_t; narrower U16 formats retain their
+  // general path because the ABI also permits noncanonical input codes.
+  if (c->operation == CP_PRODUCT && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
+      (c->format.storage == CP_U8 || (c->format.storage == CP_U16 && c->format.bits == 16)) &&
+      weight32768 == std::floor(weight32768)) {
+    if (c->format.storage == CP_U8)
+      return WeightedRows<uint8_t, CP_PRODUCT>(a, b, output, r, static_cast<uint32_t>(weight32768));
+    return WeightedRows<uint16_t, CP_PRODUCT>(a, b, output, r, static_cast<uint32_t>(weight32768));
+  }
+  // Add's largest rounded numerator is 2*65535*32768+16384 < 2^32.
+  // Subtract uses a signed difference. The dyadic double expression is exact
+  // in either case, and clamping follows the sum, including narrow U16 formats.
+  if ((c->operation == CP_ADD || c->operation == CP_SUBTRACT) && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
+      c->format.storage != CP_F32 && weight32768 == std::floor(weight32768)) {
+    const auto max = static_cast<uint32_t>(maximum(c->format));
+    const auto weight = static_cast<uint32_t>(weight32768);
+    if (c->format.storage == CP_U8)
+      return c->operation == CP_ADD ? WeightedRows<uint8_t, CP_ADD>(a, b, output, r, weight, max)
+                                    : WeightedRows<uint8_t, CP_SUBTRACT>(a, b, output, r, weight, max);
+    return c->operation == CP_ADD ? WeightedRows<uint16_t, CP_ADD>(a, b, output, r, weight, max)
+                                  : WeightedRows<uint16_t, CP_SUBTRACT>(a, b, output, r, weight, max);
   }
   // At full opacity, continuous and code mask weights are identical.
   if (c->format.storage != CP_F32 && (c->weight_rule == CP_WEIGHT_CODE || c->opacity == 1) &&
