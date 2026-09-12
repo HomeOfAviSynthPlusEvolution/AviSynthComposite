@@ -409,7 +409,7 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const double opacity_value = c->opacity, neutral_value = c->neutral;
+  const double opacity_value = c->opacity, neutral_value = c->neutral, bias_value = c->bias;
   const auto blend = [&](auto af, auto bf, auto mf) HWY_ATTR {
     const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, opacity_value);
     const auto neutral = hn::Set(d, neutral_value);
@@ -418,6 +418,8 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     auto target = bv;
     if constexpr (operation == CP_PRODUCT)
       target = hn::Mul(av, bv);
+    else if constexpr (operation == CP_DIFFERENCE)
+      target = hn::Add(hn::Sub(av, bv), hn::Set(d, bias_value));
     else if constexpr (operation == CP_GUIDED_MULTIPLY)
       target = hn::Add(neutral, hn::Mul(hn::Sub(av, neutral), bv));
     // Unmasked MIX copy endpoints were already handled by Plane.
@@ -711,6 +713,10 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
       output.step == 4 && (!mask || mask->step == 4))
     return mask ? FloatBlendRows<CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
                 : FloatBlendRows<CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+  if (c->format.storage == CP_F32 && c->operation == CP_DIFFERENCE && a.step == 4 && b.step == 4 &&
+      output.step == 4 && (!mask || mask->step == 4))
+    return mask ? FloatBlendRows<CP_DIFFERENCE, true>(c, a, b, mask, output, r)
+                : FloatBlendRows<CP_DIFFERENCE, false>(c, a, b, nullptr, output, r);
   if (c->format.storage == CP_F32 && a.step == 4 && b.step == 4 && output.step == 4 && (!mask || mask->step == 4)) {
     if (c->operation == CP_MIX)
       return mask ? FloatBlendRows<CP_MIX, true>(c, a, b, mask, output, r)
