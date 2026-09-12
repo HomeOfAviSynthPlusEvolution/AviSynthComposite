@@ -157,22 +157,10 @@ HWY_NOINLINE int MaskedContinuousRows(const cp_plane_config* c, cp_const_plane a
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
                           mask.step == sizeof(T) && output.step == sizeof(T);
   for (int y = r.first; y < r.first + r.count; ++y) {
-    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t, size_t) HWY_ATTR {
       const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
       auto bv = hn::PromoteTo(d, bc);
       const auto max = hn::Set(d, maximum_code);
-      if constexpr (sizeof(T) == 2) {
-        // The ABI permits noncanonical narrow-U16 samples, including masks
-        // above maximum which extrapolate. Keep their reference arithmetic.
-        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
-          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
-          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
-          const cp_const_plane mp{address(mask, int(x), y), mask.stride, mask.step};
-          const cp_plane op{address(output, int(x), y), output.stride, output.step};
-          cp_process_plane(c, ap, bp, &mp, nullptr, nullptr, op, {int(count), 1, 0, 1});
-          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
-        }
-      }
       if constexpr (invert)
         bv = hn::Sub(max, bv);
       const auto scaled = hn::Mul(hn::ConvertTo(df, mv), hn::Set(df, factor));
@@ -213,22 +201,9 @@ HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane 
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
                           (!masked || mask.step == sizeof(T)) && output.step == sizeof(T);
   for (int y = r.first; y < r.first + r.count; ++y) {
-    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t, size_t) HWY_ATTR {
       const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
       auto bv = hn::PromoteTo(d, bc);
-      const auto max = hn::Set(d, maximum_code);
-      if constexpr (sizeof(T) == 2) {
-        // The ABI permits noncanonical narrow-U16 samples, including masks
-        // above maximum which extrapolate. Keep their reference arithmetic.
-        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
-          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
-          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
-          const cp_const_plane mp = masked ? cp_const_plane{address(mask, int(x), y), mask.stride, mask.step} : cp_const_plane{};
-          const cp_plane op{address(output, int(x), y), output.stride, output.step};
-          cp_process_plane(c, ap, bp, masked ? &mp : nullptr, nullptr, nullptr, op, {int(count), 1, 0, 1});
-          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
-        }
-      }
       bv = DivideCode(d, hn::Mul(av, bv), c->format.bits);
       const auto scaled = hn::Mul(hn::ConvertTo(df, mv), hn::Set(df, factor));
       const auto weight = hn::BitCast(d, hn::ConvertTo(di, hn::Add(scaled, hn::Set(df, .5f))));
@@ -268,22 +243,9 @@ HWY_NOINLINE int GuidedContinuousRows(const cp_plane_config* c, cp_const_plane a
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
                           (!masked || mask.step == sizeof(T)) && output.step == sizeof(T);
   for (int y = r.first; y < r.first + r.count; ++y) {
-    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t, size_t) HWY_ATTR {
       const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
       auto bv = hn::PromoteTo(d, bc);
-      const auto max = hn::Set(d, maximum_code);
-      if constexpr (sizeof(T) == 2) {
-        // The ABI permits noncanonical narrow-U16 samples, including masks
-        // above maximum which extrapolate. Keep their reference arithmetic.
-        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
-          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
-          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
-          const cp_const_plane mp = masked ? cp_const_plane{address(mask, int(x), y), mask.stride, mask.step} : cp_const_plane{};
-          const cp_plane op{address(output, int(x), y), output.stride, output.step};
-          cp_process_plane(c, ap, bp, masked ? &mp : nullptr, nullptr, &bp, op, {int(count), 1, 0, 1});
-          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
-        }
-      }
       // With canonical codes, bounded neutral and interior opacity, all
       // magnitudes are <= M. A conservative 32*float_epsilon*M error bound
       // is < 0.25 code through 16 bits, hence final rounding differs <= 1.
@@ -330,22 +292,10 @@ HWY_NOINLINE int ArithmeticContinuousRows(const cp_plane_config* c, cp_const_pla
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) &&
                           (!masked || mask.step == sizeof(T)) && output.step == sizeof(T);
   for (int y = r.first; y < r.first + r.count; ++y) {
-    const auto blend = [&](auto ac, auto bc, auto mc, size_t x, size_t count) HWY_ATTR {
+    const auto blend = [&](auto ac, auto bc, auto mc, size_t, size_t) HWY_ATTR {
       const auto av = hn::PromoteTo(d, ac), mv = hn::PromoteTo(d, mc);
       auto bv = hn::PromoteTo(d, bc);
       const auto max = hn::Set(d, maximum_code);
-      if constexpr (sizeof(T) == 2) {
-        // The ABI permits noncanonical narrow-U16 samples, including masks
-        // above maximum which extrapolate. Keep their reference arithmetic.
-        if (c->format.bits < 16 && !hn::AllTrue(d, hn::Le(hn::Max(hn::Max(av, bv), mv), max))) {
-          const cp_const_plane ap{address(a, int(x), y), a.stride, a.step};
-          const cp_const_plane bp{address(b, int(x), y), b.stride, b.step};
-          const cp_const_plane mp = masked ? cp_const_plane{address(mask, int(x), y), mask.stride, mask.step} : cp_const_plane{};
-          const cp_plane op{address(output, int(x), y), output.stride, output.step};
-          cp_process_plane(c, ap, bp, masked ? &mp : nullptr, nullptr, nullptr, op, {int(count), 1, 0, 1});
-          return LoadChannel(dt, {op.data, op.stride, op.step}, 0, 0, count);
-        }
-      }
       auto negative = hn::Eq(hn::Zero(d), hn::Set(d, 1));
       if constexpr (operation == CP_SUBTRACT)
         negative = hn::Eq(hn::Zero(d), hn::Zero(d));
@@ -530,7 +480,7 @@ int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane 
     }
     v = hn::Min(max, hn::Max(zero, v));
     auto code = hn::DemoteTo(dt, hn::ConvertTo(di, hn::DemoteTo(df, hn::Floor(hn::Add(v, half)))));
-    // Copy endpoints retain even noncanonical input codes, as the C ABI does.
+    // Preserve exact copy endpoints for valid input samples.
     if constexpr (operation == CP_MIX)
       code = hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, hn::Set(d, 1))), bc, code);
     return hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, zero)), ac, code);
@@ -794,8 +744,8 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
   }
   // A floored integer product blended with an exact k/32768 weight is
   // integral arithmetic. Full-range storage keeps both the product division
-  // and weighted sum within uint32_t; narrower U16 formats retain their
-  // general path because the ABI also permits noncanonical input codes.
+  // and weighted sum within uint32_t. Narrower U16 formats use the
+  // general depth-aware product kernel.
   if (c->operation == CP_PRODUCT && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
       (c->format.storage == CP_U8 || (c->format.storage == CP_U16 && c->format.bits == 16)) &&
       weight32768 == std::floor(weight32768)) {

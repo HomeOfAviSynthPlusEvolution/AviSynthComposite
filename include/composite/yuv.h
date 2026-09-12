@@ -40,8 +40,8 @@ typedef struct cp_yuv_config {
 // This is the fused equivalent of three CP_GUIDED_MULTIPLY/CONTINUOUS calls.
 // Integer SIMD MULTIPLY with interior opacity (0 < opacity < 1) may differ
 // from scalar by at most 1 LSB for canonical codes. Zero/full opacity and
-// F32 retain their existing behavior. Noncanonical narrow-U16 vectors use the
-// scalar reference. Use cp_process_yuv for reference arithmetic.
+// F32 retain their existing behavior. Inputs must fit the declared depth.
+// Use cp_process_yuv for reference arithmetic on valid inputs.
 // F32 supports Add/Subtract/Multiply. Other artistic modes reject float. Integer artistic
 // modes (excluding MULTIPLY) desaturate UV on Y overshoot across 32*2^(bits-8) codes and saturates outputs.
 // Float Add/Subtract clamps only overflowing Y in the operation's direction,

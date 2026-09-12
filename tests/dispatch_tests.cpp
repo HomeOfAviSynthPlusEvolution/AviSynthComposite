@@ -240,10 +240,10 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   constexpr int count = 65541;
   std::vector<T> a(count), b(count), got(count), expected(count);
   for (int i = 0; i < count; ++i) {
-    a[i] = T(i);
-    b[i] = sizeof(T) == 1 ? T(i >> 8) : T(uint32_t(i) * 40503u + 19u);
+    a[i] = T(i & ((1u << bits) - 1));
+    b[i] = sizeof(T) == 1 ? T(i >> 8) : T((uint32_t(i) * 40503u + 19u) & ((1u << bits) - 1));
   }
-  const T maximum = std::numeric_limits<T>::max();
+  const T maximum = T((1u << bits) - 1);
   a[65536] = b[65536] = maximum;
   a[65537] = maximum;
   b[65537] = 0;
@@ -252,7 +252,7 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   a[65539] = maximum / 2;
   b[65539] = maximum;
   // Enumerate every U8 pair, or every U16 base code with a permuted source.
-  // Narrow U16 formats deliberately include noncanonical samples.
+  // Narrow U16 inputs obey the declared-depth precondition.
   const ptrdiff_t pitch = count * ptrdiff_t(sizeof(T));
   const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)};
   const cp_rows rows{count, 1, 0, 1};
@@ -311,9 +311,9 @@ static void QuantizedMix(const cp_kernels* k, int bits, int operation = CP_MIX) 
   std::vector<T> a(count), b(count), got(count), ref(count);
   std::mt19937 rng(2718 + bits);
   for (int i = 0; i < count; ++i) {
-    // Exhaust every U8 pair, and include noncanonical U16 storage values.
-    a[i] = sizeof(T) == 1 ? T(i >> 8) : T(rng());
-    b[i] = sizeof(T) == 1 ? T(i) : T(rng());
+    // Exhaust every U8 pair and sample the declared U16 code range.
+    a[i] = sizeof(T) == 1 ? T(i >> 8) : T(rng() & maximum);
+    b[i] = sizeof(T) == 1 ? T(i) : T(rng() & maximum);
   }
   a[count - 3] = 0; b[count - 3] = T(maximum);
   a[count - 2] = T(maximum); b[count - 2] = 0;
@@ -362,10 +362,10 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
   const cp_rows rows{count, 1, 0, 1};
   for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT, CP_ADD, CP_SUBTRACT, CP_DIFFERENCE})
     for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
-      for (bool noncanonical : {false, true}) {
-        // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
-        a[17] = noncanonical ? std::numeric_limits<T>::max() : T(max / 2);
-        m[count - 1] = noncanonical ? std::numeric_limits<T>::max() : T(max);
+      for (bool endpoints : {false, true}) {
+        // Exercise legal endpoint codes in both a full vector and the tail.
+        a[17] = endpoints ? T(max) : T(max / 2);
+        m[count - 1] = endpoints ? T(max) : T(0);
         cp_plane_config c{};
         c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
         c.operation = op; c.opacity = opacity; c.inversion_sum = max; c.bias = (max + 1) / 2; c.weight_rule = CP_WEIGHT_CONTINUOUS;
@@ -377,8 +377,7 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
           CHECK(k->process_plane(&c, alias == 1 ? in : pa, alias == 2 ? in : pb, &mask_in, nullptr, nullptr,
                                   {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
           for (int i = 0; i < count; ++i) {
-            const bool exact = opacity == 0 || m[i] == 0 || (opacity == 1 && m[i] == max) ||
-                                a[i] > max || b[i] > max || m[i] > max;
+            const bool exact = opacity == 0 || m[i] == 0 || (opacity == 1 && m[i] == max);
             if (std::abs(int(got[i]) - int(ref[i])) > (exact ? 0 : 1))
               std::fprintf(stderr, "quantized op=%d bits=%d opacity=%.17g alias=%d i=%d a=%u b=%u m=%u got=%u ref=%u\n", op, bits, opacity, alias, i, unsigned(a[i]), unsigned(b[i]), unsigned(m[i]), unsigned(got[i]), unsigned(ref[i]));
             CHECK(std::abs(int(got[i]) - int(ref[i])) <= (exact ? 0 : 1));
@@ -401,11 +400,11 @@ static void GuidedBounded(const cp_kernels* k, int bits) {
   const cp_rows rows{count, 1, 0, 1};
   for (double neutral : {0., .1, double(max) / 2, double(max), -1., double(max) + 1.})
     for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
-      for (bool noncanonical : {false, true}) {
-        // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
-        b[33] = noncanonical ? std::numeric_limits<T>::max() : T(max / 3);
-        a[17] = noncanonical ? std::numeric_limits<T>::max() : T(max / 2);
-        m[count - 1] = noncanonical ? std::numeric_limits<T>::max() : T(max);
+      for (bool endpoints : {false, true}) {
+        // Exercise legal endpoint codes in both a full vector and the tail.
+        b[33] = endpoints ? T(max) : T(max / 3);
+        a[17] = endpoints ? T(max) : T(max / 2);
+        m[count - 1] = endpoints ? T(max) : T(0);
         cp_plane_config c{};
         c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
         const int op = CP_GUIDED_MULTIPLY; c.operation = op; c.neutral = neutral; c.opacity = opacity; c.inversion_sum = max; c.bias = (max + 1) / 2; c.weight_rule = CP_WEIGHT_CONTINUOUS;
@@ -417,8 +416,7 @@ static void GuidedBounded(const cp_kernels* k, int bits) {
           CHECK(k->process_plane(&c, alias == 1 ? in : pa, alias == 2 ? in : pb, &mask_in, nullptr, &(alias == 2 ? in : pb),
                                   {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
           for (int i = 0; i < count; ++i) {
-            const bool exact = opacity == 0 || opacity == 1 || neutral < 0 || neutral > max || m[i] == 0 || (opacity == 1 && m[i] == max) ||
-                                a[i] > max || b[i] > max || m[i] > max;
+            const bool exact = opacity == 0 || opacity == 1 || neutral < 0 || neutral > max || m[i] == 0 || (opacity == 1 && m[i] == max);
             if (std::abs(int(got[i]) - int(ref[i])) > (exact ? 0 : 1))
               std::fprintf(stderr, "quantized op=%d bits=%d opacity=%.17g alias=%d i=%d a=%u b=%u m=%u got=%u ref=%u\n", op, bits, opacity, alias, i, unsigned(a[i]), unsigned(b[i]), unsigned(m[i]), unsigned(got[i]), unsigned(ref[i]));
             CHECK(std::abs(int(got[i]) - int(ref[i])) <= (exact ? 0 : 1));

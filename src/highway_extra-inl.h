@@ -249,30 +249,6 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
       dest[p] = reinterpret_cast<T*>(address(out[p], 0, y));
     }
     for (size_t x = 0; x < end; x += n) {
-      if constexpr (approximate && sizeof(T) == 2) {
-        if (c->format.bits < 16) {
-          const auto max_code = hn::Set(dt, T(maximum));
-          bool canonical = hn::AllTrue(dt, hn::Le(hn::LoadU(dt, guide_row + x), max_code));
-          for (int p = 0; p < 3; ++p) {
-            canonical = canonical && hn::AllTrue(dt, hn::Le(hn::LoadU(dt, rows[p] + x), max_code));
-            if constexpr (masked)
-              canonical = canonical && hn::AllTrue(dt, hn::Le(hn::LoadU(dt, mask_rows[p] + x), max_code));
-          }
-          if (!canonical) {
-            const auto slice = [&](cp_const_plane p) HWY_ATTR {
-              return cp_const_plane{address(p, int(x), y), p.stride, p.step};
-            };
-            const auto dest = [&](cp_plane p) HWY_ATTR {
-              return cp_plane{address(p, int(x), y), p.stride, p.step};
-            };
-            const cp_const_yuv aa{slice(a[0]), slice(a[1]), slice(a[2])};
-            const cp_const_yuv bb{slice(source.y), slice(source.u), slice(source.v)};
-            const cp_const_yuv mm = masked ? cp_const_yuv{slice(m[0]), slice(m[1]), slice(m[2])} : cp_const_yuv{};
-            cp_process_yuv(c, aa, bb, masked ? &mm : nullptr, {dest(out[0]), dest(out[1]), dest(out[2])}, {int(n), 1, 0, 1});
-            continue;
-          }
-        }
-      }
       const auto guide = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, guide_row + x)));
       const auto slope = hn::Sub(hn::Mul(guide, reciprocal), one);
       const auto common_weight =

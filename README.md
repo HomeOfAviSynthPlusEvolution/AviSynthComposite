@@ -81,8 +81,8 @@ the double scalar reference by at most **1 LSB per call**, including rounding
 boundaries. Unmasked integer continuous `CP_INVERT_MIX` may use Q16 weights
 when `inversion_sum` is integral and in [0,65535], also with at most 1 LSB error.
 Masked integer continuous MIX and INVERT_MIX (`inversion_sum == maximum`)
-may similarly quantize their combined effective weight to Q16 within 1 LSB;
-noncanonical narrow-U16 inputs retain scalar evaluation. Exact zero-weight and
+may similarly quantize their combined effective weight to Q16 within 1 LSB.
+Exact zero-weight and
 full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for interior opacity, as
 described below. These allowances do not extend to other operations (except additional integer operations documented below), code weights,
 or F32. Repeated
@@ -239,22 +239,25 @@ semantic clarifications. No upstream golden source is distributed in this tree.
 Integer YUV Overlay Multiply may use binary32 SIMD for interior opacity
 (0 < opacity < 1). For canonical input codes, the final output differs
 from the scalar reference by at most 1 LSB. Zero and full opacity retain their
-existing exact behavior; floating-point formats are unchanged. Noncanonical
-narrow-U16 vectors retain scalar reference arithmetic.
+existing exact behavior; floating-point formats are unchanged.
 
 Integer continuous PRODUCT may quantize its blend weight to Q16, with at most
 1 LSB output difference. The product is still floored before blending.
-Noncanonical narrow-U16 inputs fall back to reference arithmetic.
 
 Integer continuous ADD and SUBTRACT may quantize the effective weight to Q16.
-The final clipped output differs by at most 1 LSB; noncanonical narrow-U16
-inputs retain scalar evaluation, and exact zero/full-weight endpoints remain exact.
+The final clipped output differs by at most 1 LSB; exact zero/full-weight endpoints remain exact.
 
 Integer continuous DIFFERENCE may use Q16 weights when bias is an integer in
 [0, 65535]. Its final clipped result differs by at most 1 LSB. Fractional or
-out-of-range bias and noncanonical narrow-U16 inputs retain scalar arithmetic.
+out-of-range bias retains reference arithmetic.
 
 Integer continuous GUIDED_MULTIPLY may use float SIMD for 0 < opacity < 1
 and neutral in [0, maximum]. Final output differs by at most 1 LSB. Full
-opacity, out-of-range neutral, and noncanonical narrow-U16 inputs retain the
+opacity and out-of-range neutral retain the
 reference calculation; zero mask preserves the original code exactly.
+
+Integer input samples, guides and masks must fit the declared bit depth, as
+required by `types.h` (10-bit: 0..1023, not the narrower video limited range).
+SIMD kernels do not scan for violations or guarantee scalar-equivalent results
+for them. Geometry and descriptor validation, and bounds-safe access, remain
+unchanged. F32 color excursions remain supported under their existing contract.
