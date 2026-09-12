@@ -809,6 +809,7 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
 // Shared-mask F32 fast path. With guide in [0,1] and opacity <= .75,
 // the factor is in [.25,1], avoiding cancellation and overflow. The
 // relative error is bounded by 8*float_epsilon, plus subnormal rounding.
+template <bool masked>
 void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b,
                             const cp_const_yuv* m, cp_yuv out, cp_rows r) {
   const hn::ScalableTag<float> d;
@@ -822,7 +823,7 @@ void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv
       const auto load = [&](cp_const_plane p) HWY_ATTR {
         return hn::LoadU(d, reinterpret_cast<const float*>(address(p, int(x), y)));
       };
-      const auto guide = load(b.y), mask = load(m->y);
+      const auto guide = load(b.y), mask = masked ? load(m->y) : one;
       const auto ay = load(a.y), au = load(a.u), av = load(a.v);
       const auto finite = hn::And(hn::Le(hn::Abs(ay), largest),
                          hn::And(hn::Le(hn::Abs(au), largest), hn::Le(hn::Abs(av), largest)));
@@ -830,8 +831,8 @@ void MultiplyYuvFloatShared(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv
         const auto input = [&](cp_const_plane p) { return cp_const_plane{address(p, int(x), y), p.stride, p.step}; };
         const auto output = [&](cp_plane p) { return cp_plane{address(p, int(x), y), p.stride, p.step}; };
         const cp_const_yuv aa{input(a.y), input(a.u), input(a.v)}, bb{input(b.y), input(b.u), input(b.v)};
-        const cp_const_yuv mm{input(m->y), input(m->u), input(m->v)};
-        MultiplyYuvRows<float, true>(c, aa, bb, &mm, {output(out.y), output(out.u), output(out.v)}, {int(n), 1, 0, 1});
+        const cp_const_yuv mm = masked ? cp_const_yuv{input(m->y), input(m->u), input(m->v)} : cp_const_yuv{};
+        MultiplyYuvRows<float, masked>(c, aa, bb, masked ? &mm : nullptr, {output(out.y), output(out.u), output(out.v)}, {int(n), 1, 0, 1});
         continue;
       }
       const auto factor = hn::Sub(one, hn::Mul(hn::Mul(mask, opacity), hn::Sub(one, guide)));
@@ -1150,13 +1151,16 @@ int Yuv(const cp_yuv_config* c, cp_const_yuv a, cp_const_yuv b, const cp_const_y
         m->y.step == 4 && m->u.step == 4 && m->v.step == 4 &&
         a.y.step == 4 && a.u.step == 4 && a.v.step == 4 && b.y.step == 4 &&
         out.y.step == 4 && out.u.step == 4 && out.v.step == 4) {
-      MultiplyYuvFloatShared(c, a, b, m, out, r);
+      MultiplyYuvFloatShared<true>(c, a, b, m, out, r);
       return CP_OK;
     }
     if (c->format.storage == CP_F32 && !m && c->opacity > 0 && c->opacity < 1 &&
         a.y.step == 4 && a.u.step == 4 && a.v.step == 4 && b.y.step == 4 &&
         out.y.step == 4 && out.u.step == 4 && out.v.step == 4) {
-      MultiplyYuvRows<float, false, true>(c, a, b, nullptr, out, r);
+      if (c->opacity <= .75)
+        MultiplyYuvFloatShared<false>(c, a, b, nullptr, out, r);
+      else
+        MultiplyYuvRows<float, false, true>(c, a, b, nullptr, out, r);
       return CP_OK;
     }
     if (c->format.storage == CP_U8) {

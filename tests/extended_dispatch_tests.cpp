@@ -44,7 +44,7 @@ struct Image {
   }
 };
 template <class T>
-void same(const Image<T>& a, const Image<T>& b, const char* label, int tolerance = 0) {
+void same(const Image<T>& a, const Image<T>& b, const char* label, double tolerance = 0) {
   CHECK(a.data.size() == b.data.size());
   for (size_t i = 0; i < a.data.size(); ++i)
     if (std::memcmp(&a.data[i], &b.data[i], sizeof(T))) {
@@ -53,7 +53,8 @@ void same(const Image<T>& a, const Image<T>& b, const char* label, int tolerance
         const auto x = ptrdiff_t(i) - a.origin - y * a.pitch;
         pixel = pixel || (x >= 0 && x < a.w * a.step && x % a.step == 0);
       }
-      if (tolerance && pixel && std::abs(double(a.data[i]) - double(b.data[i])) <= tolerance)
+      if (tolerance && pixel && std::abs(double(a.data[i]) - double(b.data[i])) <= tolerance *
+          (std::is_same<T, float>::value ? std::max(1.0, std::abs(double(b.data[i]))) : 1.0))
         continue;
       if constexpr (std::is_same<T, float>::value)
         if (std::isnan(a.data[i]) && std::isnan(b.data[i]))
@@ -128,7 +129,8 @@ void Yuv(const cp_kernels* k, int bits, int width, int step, bool negative) {
     for (double opacity : {0.0, .003, .17, .5, .63, 1.0})
       for (bool masked : {false, true}) {
         cp_yuv_config c = {f, mode, opacity};
-        const int tolerance = bits != 32 && mode == CP_YUV_MULTIPLY && opacity > 0 && opacity < 1 ? 1 : 0;
+        const double tolerance = mode == CP_YUV_MULTIPLY && opacity > 0 && opacity < 1
+            ? (bits == 32 ? (opacity <= .75 ? 8 * std::numeric_limits<float>::epsilon() : 0) : 1) : 0;
         const cp_yuv gv = {got[0].out(), got[1].out(), got[2].out()}, rv = {ref[0].out(), ref[1].out(), ref[2].out()};
         const int expected = bits == 32 && mode > CP_YUV_SUBTRACT && mode != CP_YUV_MULTIPLY ? CP_UNSUPPORTED : CP_OK;
         CHECK(k->process_yuv(&c, av, bv, masked ? &mv : nullptr, gv, band) == expected);
@@ -708,7 +710,8 @@ static void SharedFloatMultiply(const cp_kernels* k) {
   constexpr int count = 4099;
   std::mt19937 rng(9182);
   double largest_error = 0;
-  for (bool negative : {false, true})
+  for (bool masked : {false, true})
+   for (bool negative : {false, true})
     for (double opacity : {.003, .17, .625, .75, std::nextafter(.75, 1.), 1.})
       for (int scenario = 0; scenario < 4; ++scenario) {
         Image<float> proto(count, 2, 1, negative);
@@ -737,12 +740,12 @@ static void SharedFloatMultiply(const cp_kernels* k) {
           const cp_const_yuv ga = alias == 1 ? cp_const_yuv{got[0].in(), got[1].in(), got[2].in()} : input;
           const cp_const_yuv ra = alias == 1 ? cp_const_yuv{ref[0].in(), ref[1].in(), ref[2].in()} : input;
           const cp_yuv_config c{format(32), CP_YUV_MULTIPLY, opacity};
-          CHECK(k->process_yuv(&c, ga, gg, &gmask, {got[0].out(), got[1].out(), got[2].out()}, proto.rows()) == CP_OK);
-          CHECK(cp_process_yuv(&c, ra, gg, &rmask, {ref[0].out(), ref[1].out(), ref[2].out()}, proto.rows()) == CP_OK);
+          CHECK(k->process_yuv(&c, ga, gg, masked ? &gmask : nullptr, {got[0].out(), got[1].out(), got[2].out()}, proto.rows()) == CP_OK);
+          CHECK(cp_process_yuv(&c, ra, gg, masked ? &rmask : nullptr, {ref[0].out(), ref[1].out(), ref[2].out()}, proto.rows()) == CP_OK);
           for (int p = 0; p < 3; ++p) for (int y = 0; y < 2; ++y) for (int x = 0; x < count; ++x) {
             const int j = proto.origin + y * proto.pitch + x;
             const float v = got[p].data[j], expected = ref[p].data[j];
-            if (mask.data[j] == 0 || opacity > .75 || guide.data[j] < 0 || guide.data[j] > 1)
+            if ((masked && mask.data[j] == 0) || opacity > .75 || guide.data[j] < 0 || guide.data[j] > 1)
               CHECK(std::memcmp(&v, &expected, sizeof(float)) == 0);
             else {
               const double error = std::abs(double(v) - expected);

@@ -262,7 +262,7 @@ SIMD kernels do not scan for violations or guarantee scalar-equivalent results
 for them. Geometry and descriptor validation, and bounds-safe access, remain
 unchanged. F32 color excursions remain supported under their existing contract.
 
-F32 YUV Overlay Multiply with continuous, shared-mask planes and
+F32 YUV Overlay Multiply with continuous planes with no mask or a shared mask and
 0 < opacity <= .75 may use binary32 arithmetic when guide Y is in [0,1]
 and the base colors are finite. Its error relative to scalar is bounded by
 `8 * FLT_EPSILON * abs(reference) + 2 * FLT_TRUE_MIN` (about 0.0000954%
