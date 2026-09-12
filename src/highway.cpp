@@ -418,6 +418,8 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
     auto target = bv;
     if constexpr (operation == CP_PRODUCT)
       target = hn::Mul(av, bv);
+    else if constexpr (operation == CP_SUBTRACT)
+      target = hn::Sub(av, bv);
     else if constexpr (operation == CP_ADD)
       target = hn::Add(av, bv);
     else if constexpr (operation == CP_DIFFERENCE)
@@ -460,15 +462,16 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
   return CP_OK;
 }
 
-template <class T>
+template <class T, int fixed_operation = -1>
 int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
               const cp_const_plane* ga, const cp_const_plane* gb, cp_plane output, cp_rows r) {
+  const int operation = fixed_operation < 0 ? c->operation : fixed_operation;
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const hn::Rebind<T, decltype(d)> dt;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width), end = width - width % n;
-  const bool select = c->operation == CP_SELECT_LIGHTER || c->operation == CP_SELECT_DARKER;
-  const bool guided = select || c->operation == CP_GUIDED_MULTIPLY;
+  const bool select = operation == CP_SELECT_LIGHTER || operation == CP_SELECT_DARKER;
+  const bool guided = select || operation == CP_GUIDED_MULTIPLY;
   const bool code = !std::is_same<T, float>::value && c->weight_rule == CP_WEIGHT_CODE;
   const double maximum = cp::maximum(c->format);
   const auto zero = hn::Zero(d), one = hn::Set(d, 1.0), max = hn::Set(d, maximum), half = hn::Set(d, 0.5);
@@ -488,7 +491,7 @@ int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cons
                     : hn::Mul(opacity, hn::Div(mv, max));
       const auto guide = guided ? LoadDouble<T>(d, *gb, static_cast<int>(x), y, n) : zero;
       if (select) {
-        const bool lighter = c->operation == CP_SELECT_LIGHTER;
+        const bool lighter = operation == CP_SELECT_LIGHTER;
         double threshold = lighter ? c->threshold : -c->threshold;
         if constexpr (std::is_same<T, float>::value)
           threshold = static_cast<float>(threshold);
@@ -500,7 +503,7 @@ int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cons
         w = hn::IfThenElse(accepted, w, zero);
       }
       auto target = bv;
-      switch (c->operation) {
+      switch (operation) {
         case CP_ADD:
           target = hn::Add(av, bv);
           break;
@@ -525,14 +528,14 @@ int PlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, cons
           break;
       }
       auto result = mix(av, target, w);
-      if (code && c->operation == CP_GUIDED_MULTIPLY) {
+      if (code && operation == CP_GUIDED_MULTIPLY) {
         const auto darken = hn::Div(hn::Floor(hn::Add(hn::Mul(w, hn::Sub(max, guide)), half)), max);
         result = mix(av, neutral, darken);
       }
       if constexpr (std::is_same<T, float>::value) {
         auto value = hn::DemoteTo(df, result);
         // Keep source bits for exact copy endpoints (including NaN payloads).
-        if (c->operation == CP_MIX || select)
+        if (operation == CP_MIX || select)
           value =
               hn::IfThenElse(NarrowMask(df, d, hn::Eq(w, one)), LoadChannel(df, b, static_cast<int>(x), y, n), value);
         value =
@@ -715,6 +718,13 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
       output.step == 4 && (!mask || mask->step == 4))
     return mask ? FloatBlendRows<CP_GUIDED_MULTIPLY, true>(c, a, *gb, mask, output, r)
                 : FloatBlendRows<CP_GUIDED_MULTIPLY, false>(c, a, *gb, nullptr, output, r);
+  if (c->format.storage == CP_F32 && c->operation == CP_SUBTRACT) {
+    if (a.step == 4 && b.step == 4 && output.step == 4 && (!mask || mask->step == 4))
+      return mask ? FloatBlendRows<CP_SUBTRACT, true>(c, a, b, mask, output, r)
+                  : FloatBlendRows<CP_SUBTRACT, false>(c, a, b, nullptr, output, r);
+    // Keep the established stepped memory loop, specializing only its operation.
+    return PlaneRows<float, CP_SUBTRACT>(c, a, b, mask, ga, gb, output, r);
+  }
   if (c->format.storage == CP_F32 && c->operation == CP_ADD && a.step == 4 && b.step == 4 &&
       output.step == 4 && (!mask || mask->step == 4))
     return mask ? FloatBlendRows<CP_ADD, true>(c, a, b, mask, output, r)
