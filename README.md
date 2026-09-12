@@ -75,6 +75,15 @@ Unused channels are left untouched by individual plane calls. For multi-channel
 composition, preserve original guides and weight masks until all dependent channels
 have finished. No function allocates memory or modifies global dispatch state.
 
+For unmasked integer `CP_MIX` with `CP_WEIGHT_CONTINUOUS`, SIMD backends may
+round opacity to Q15 (`round(opacity * 32768) / 32768`). Results differ from
+the double scalar reference by at most **1 LSB per call**, including rounding
+boundaries. Exact opacity 0 and 1 retain exact copies. This allowance does not
+extend to masked mixing, other operations, code weights, or F32. Repeated
+operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
+for reference arithmetic; increasing working bit depth before processing reduces
+the normalized size of a code-value error.
+
 Integer storage is U8/8 or U16/9–16 bits; float storage is F32/32. Float chroma is
 centered at zero; integer chroma is centered at `2^(bits-1)`. Mask channels always
 use nonnegative opacity values, even when attached to chroma. Consult headers for
@@ -150,7 +159,8 @@ chroma neutral (or zero for float); `guided` retains continuous weights and its
 existing half-maximum neutral. These are distinct arithmetic contracts.
 
 Inputs are deterministic. Before timing, every backend is checked against the C
-reference, including untouched samples; local backends must be bit-exact. Upstream
+reference, including untouched samples; local backends must be bit-exact except
+for the documented 1 LSB allowance for unmasked integer continuous MIX. Upstream
 integer Layer results must be exact and float results within 2e-7 (the existing
 Layer fixture tolerance). Any mismatch fails the run. Each timed call follows a
 reset from the same base, with two warmups and the requested measured trials;

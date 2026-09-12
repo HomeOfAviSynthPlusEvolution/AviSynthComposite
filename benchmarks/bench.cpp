@@ -236,7 +236,8 @@ void run(int bits, int step) {
                   << '\n';
       };
       for (auto target : targets)
-        measure(std::to_string(target), [&] { invoke(cp_get_kernels(target), output); }, 0);
+        measure(std::to_string(target), [&] { invoke(cp_get_kernels(target), output); },
+                bits != 32 && workload == "mix" && !masked ? 1 : 0);
 #ifdef CP_BENCH_AVX2
       if (workload == "overlay_mul" && bits != 32 && step == 1 && (cp_supported_targets() & 512))
         measure(

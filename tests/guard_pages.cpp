@@ -100,6 +100,8 @@ void run(const cp_kernels* k, int bits, int width, int step, bool negative) {
     CHECK(k->process_plane(&arithmetic, av, bv, nullptr, nullptr, nullptr, ov, r) == CP_OK);
   }
   CHECK(k->affine(f, av, ov, r, -1, max) == CP_OK);
+  const cp_plane_config quantized{f, CP_MIX, .17, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+  CHECK(k->process_plane(&quantized, av, bv, nullptr, nullptr, nullptr, ov, r) == CP_OK);
   CHECK(k->clamp(f, av, ov, r, 0, max) == CP_OK);
   CHECK(k->rgb_luma(f, {av, bv, av}, ov, r, CP_LUMA_NEAREST) == CP_OK);
   const double key[] = {double(max), double(max), double(max)}, tol[] = {.5, .5, .5};

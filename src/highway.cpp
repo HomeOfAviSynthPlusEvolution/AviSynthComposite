@@ -81,7 +81,7 @@ hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
 // Captured vector wrappers can make MSVC spill/reassemble their halves in hot loops.
 // Exact dyadic weights need no floating-point arithmetic. Convex blends sum
 // to at most 65535*32768+16384; Add/Subtract bounds are documented below.
-// No opacity quantization occurs.
+// The MIX dispatcher may also round continuous opacity to Q15 (<=1 LSB).
 template <class T, int operation = CP_MIX>
 int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
                  uint32_t maximum_code = std::numeric_limits<T>::max(), uint32_t offset = 0) {
@@ -115,7 +115,7 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
     } else {
       auto value = hn::ShiftRight<15>(hn::Add(
           hn::Add(operation == CP_ADD ? hn::ShiftLeft<15>(base) : hn::Mul(base, inv), hn::Mul(target, w)), round));
-      if constexpr (operation == CP_ADD)
+      if constexpr (operation == CP_ADD || (operation == CP_MIX && sizeof(T) != 1))
         value = hn::Min(value, hn::Set(d, maximum_code));
       return hn::DemoteTo(dt, value);
     }
@@ -480,9 +480,20 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
   const double weight32768 = c->opacity * 32768;
   if (c->operation == CP_MIX && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS && c->format.storage != CP_F32 &&
       weight32768 == std::floor(weight32768)) {
+    const auto max = static_cast<uint32_t>(maximum(c->format));
     if (c->format.storage == CP_U8)
-      return WeightedRows<uint8_t>(a, b, output, r, static_cast<uint32_t>(weight32768));
-    return WeightedRows<uint16_t>(a, b, output, r, static_cast<uint32_t>(weight32768));
+      return WeightedRows<uint8_t>(a, b, output, r, static_cast<uint32_t>(weight32768), max);
+    return WeightedRows<uint16_t>(a, b, output, r, static_cast<uint32_t>(weight32768), max);
+  }
+  // Q15 rounding changes a convex blend by at most 65535/65536 < 1
+  // code before output rounding. Keep the exact opacity endpoints above;
+  // fractional weights which quantize to endpoints still clamp narrow U16.
+  if (c->operation == CP_MIX && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS && c->format.storage != CP_F32) {
+    const auto weight = static_cast<uint32_t>(std::floor(weight32768 + .5));
+    const auto max = static_cast<uint32_t>(maximum(c->format));
+    if (c->format.storage == CP_U8)
+      return WeightedRows<uint8_t>(a, b, output, r, weight, max);
+    return WeightedRows<uint16_t>(a, b, output, r, weight, max);
   }
   // A floored integer product blended with an exact k/32768 weight is
   // integral arithmetic. Full-range storage keeps both the product division

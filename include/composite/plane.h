@@ -18,7 +18,7 @@ enum cp_operation {
   CP_DIFFERENCE = 8       // interpolate toward base-source+bias (explicit direction).
 };
 enum cp_weight_rule {
-  CP_WEIGHT_CONTINUOUS = 0, // w=opacity*mask/max, rounded only at final output.
+  CP_WEIGHT_CONTINUOUS = 0, // Reference w=opacity*mask/max; SIMD tolerance documented below.
   CP_WEIGHT_CODE = 1        // opacity and combined mask rounded to integer code scale.
 };
 typedef struct cp_plane_config {
@@ -43,6 +43,13 @@ typedef struct cp_plane_config {
 // floors the product, matching Layer's target construction. Float is unclipped.
 // Opacity/mask zero returns base exactly; MIX and selected branches at weight 1
 // copy source exactly (including float signed zero/NaN payload).
+// SIMD dispatch may quantize unmasked integer CP_MIX continuous opacity to
+// round(opacity*32768)/32768. Output differs from this scalar reference by at
+// most 1 LSB per call, for U8 and U16 (9..16 bits). Exact opacity 0/1 copies
+// remain exact. This tolerance does not apply to masks, CODE, other operations,
+// or F32. Repeated calls can accumulate error; use CP_TARGET_C / this function
+// for reference arithmetic, or raise the working bit depth before processing
+// to reduce the normalized size of 1 LSB.
 int cp_process_plane(const cp_plane_config* config, cp_const_plane base, cp_const_plane source,
                      const cp_const_plane* mask, const cp_const_plane* base_guide, const cp_const_plane* source_guide,
                      cp_plane destination, cp_rows rows);
