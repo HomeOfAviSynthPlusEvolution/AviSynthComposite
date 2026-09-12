@@ -385,6 +385,10 @@ HWY_NOINLINE int ArithmeticContinuousRows(const cp_plane_config* c, cp_const_pla
 template <class T, bool product, bool masked, bool guided = false, int fixed_bits = 0>
 int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask, cp_plane output,
              cp_rows r) {
+  if constexpr (guided && sizeof(T) == 2 && fixed_bits == 0) {
+    if (c->format.bits == 10) return CodeRows<T, product, masked, guided, 10>(c, a, b, mask, output, r);
+    if (c->format.bits == 16) return CodeRows<T, product, masked, guided, 16>(c, a, b, mask, output, r);
+  }
   // 8-bit sums including the exact division correction fit in uint16_t.
   // Retaining narrow lanes doubles the number of samples processed per vector.
   using Acc = typename std::conditional<sizeof(T) == 1, uint16_t, uint32_t>::type;
@@ -424,7 +428,7 @@ int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const
       const auto* bp = reinterpret_cast<const T*>(address(b, 0, y));
       const auto* mp = masked ? reinterpret_cast<const T*>(address(*mask, 0, y)) : nullptr;
       auto* dst = reinterpret_cast<T*>(address(output, 0, y));
-      if constexpr (sizeof(T) == 1 && !guided) {
+      if constexpr (sizeof(T) == 1) {
         for (; x + 2 * n <= end; x += 2 * n) {
           const auto first = blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x),
                                    masked ? hn::LoadU(dt, mp + x) : hn::Zero(dt));
@@ -438,7 +442,7 @@ int CodeRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const
         hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Zero(dt)),
                    dt, dst + x);
     }
-    if constexpr (sizeof(T) == 1 && !guided) {
+    if constexpr (sizeof(T) == 1) {
       for (; x + n <= width; x += n)
         StoreChannel(blend(LoadChannel(dt, a, int(x), y, n), LoadChannel(dt, b, int(x), y, n),
                            masked ? LoadChannel(dt, *mask, int(x), y, n) : hn::Zero(dt)),
