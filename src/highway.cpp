@@ -740,6 +740,14 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
   // Add's largest rounded numerator is 2*65535*32768+16384 < 2^32.
   // Subtract uses a signed difference. The dyadic double expression is exact
   // in either case, and clamping follows the sum, including narrow U16 formats.
+  if (c->operation == CP_DIFFERENCE && c->format.storage != CP_F32 &&
+      c->weight_rule == CP_WEIGHT_CONTINUOUS && c->bias >= 0 && c->bias <= 65535 && c->bias == std::floor(c->bias)) {
+    if (c->format.storage == CP_U8)
+      return mask ? ArithmeticContinuousRows<uint8_t, true, CP_DIFFERENCE>(c, a, b, *mask, output, r)
+                  : ArithmeticContinuousRows<uint8_t, false, CP_DIFFERENCE>(c, a, b, {}, output, r);
+    return mask ? ArithmeticContinuousRows<uint16_t, true, CP_DIFFERENCE>(c, a, b, *mask, output, r)
+                : ArithmeticContinuousRows<uint16_t, false, CP_DIFFERENCE>(c, a, b, {}, output, r);
+  }
   if ((c->operation == CP_ADD || c->operation == CP_SUBTRACT) && !mask && c->weight_rule == CP_WEIGHT_CONTINUOUS &&
       c->format.storage != CP_F32 && weight32768 == std::floor(weight32768)) {
     const auto max = static_cast<uint32_t>(maximum(c->format));
@@ -757,6 +765,14 @@ int Plane(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp
     // values bounded. Fractional or larger offsets retain binary64 evaluation.
     if (offset >= 0 && offset <= 65536 && offset == std::floor(offset))
       return OffsetPlaneRows(c, a, b, output, r, static_cast<uint32_t>(weight32768), static_cast<uint32_t>(offset));
+  }
+  if (c->operation == CP_DIFFERENCE && c->format.storage != CP_F32 &&
+      c->weight_rule == CP_WEIGHT_CONTINUOUS && c->bias >= 0 && c->bias <= 65535 && c->bias == std::floor(c->bias)) {
+    if (c->format.storage == CP_U8)
+      return mask ? ArithmeticContinuousRows<uint8_t, true, CP_DIFFERENCE>(c, a, b, *mask, output, r)
+                  : ArithmeticContinuousRows<uint8_t, false, CP_DIFFERENCE>(c, a, b, {}, output, r);
+    return mask ? ArithmeticContinuousRows<uint16_t, true, CP_DIFFERENCE>(c, a, b, *mask, output, r)
+                : ArithmeticContinuousRows<uint16_t, false, CP_DIFFERENCE>(c, a, b, {}, output, r);
   }
   if ((c->operation == CP_ADD || c->operation == CP_SUBTRACT) &&
       c->format.storage != CP_F32 && c->weight_rule == CP_WEIGHT_CONTINUOUS) {

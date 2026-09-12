@@ -248,3 +248,7 @@ Noncanonical narrow-U16 inputs fall back to reference arithmetic.
 Integer continuous ADD and SUBTRACT may quantize the effective weight to Q16.
 The final clipped output differs by at most 1 LSB; noncanonical narrow-U16
 inputs retain scalar evaluation, and exact zero/full-weight endpoints remain exact.
+
+Integer continuous DIFFERENCE may use Q16 weights when bias is an integer in
+[0, 65535]. Its final clipped result differs by at most 1 LSB. Fractional or
+out-of-range bias and noncanonical narrow-U16 inputs retain scalar arithmetic.

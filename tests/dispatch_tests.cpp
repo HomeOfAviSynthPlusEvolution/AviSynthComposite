@@ -262,7 +262,7 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
   const auto check = [&]() {
     CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {expected.data(), pitch, sizeof(T)}, rows) == CP_OK);
     CHECK(k->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {got.data(), pitch, sizeof(T)}, rows) == CP_OK);
-    if (c.operation == CP_PRODUCT || c.operation == CP_ADD || c.operation == CP_SUBTRACT || (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
+    if ((c.operation == CP_DIFFERENCE && c.bias >= 0 && c.bias <= 65535 && c.bias == std::floor(c.bias)) || c.operation == CP_PRODUCT || c.operation == CP_ADD || c.operation == CP_SUBTRACT || (c.operation == CP_INVERT_MIX && c.inversion_sum >= 0 && c.inversion_sum <= 65535 &&
         c.inversion_sum == std::floor(c.inversion_sum))) {
       for (int i = 0; i < count; ++i)
         CHECK(std::abs(int(got[i]) - int(expected[i])) <= 1);
@@ -288,7 +288,7 @@ void ContinuousIntegerRounding(const cp_kernels* k, int bits) {
     for (double offset : {-1., 0., .5, double(1u << (bits - 1)), double((1u << bits) - 1), double(1u << bits), 65535.,
                           65536., 65537.}) {
       c.inversion_sum = c.bias = offset;
-      for (double opacity : {0., 1. / 32768, .5, .625, std::nextafter(.625, 1.), 32767. / 32768, 1.}) {
+      for (double opacity : {0., .17, 1. / 32768, .5, .625, std::nextafter(.625, 1.), 32767. / 32768, 1.}) {
         c.opacity = opacity;
         check();
       }
@@ -360,7 +360,7 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
   const ptrdiff_t pitch = count * sizeof(T);
   const cp_const_plane pa{a.data(), pitch, sizeof(T)}, pb{b.data(), pitch, sizeof(T)}, pm{m.data(), pitch, sizeof(T)};
   const cp_rows rows{count, 1, 0, 1};
-  for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT, CP_ADD, CP_SUBTRACT})
+  for (int op : {CP_MIX, CP_INVERT_MIX, CP_PRODUCT, CP_ADD, CP_SUBTRACT, CP_DIFFERENCE})
     for (double opacity : {0., .17, .5, .625, std::nextafter(1., 0.), 1.})
       for (bool noncanonical : {false, true}) {
         // Keep most vectors canonical; specifically exercise a fallback vector and a tail.
@@ -368,7 +368,7 @@ static void QuantizedMasked(const cp_kernels* k, int bits) {
         m[count - 1] = noncanonical ? std::numeric_limits<T>::max() : T(max);
         cp_plane_config c{};
         c.format = {sizeof(T) == 1 ? CP_U8 : CP_U16, bits};
-        c.operation = op; c.opacity = opacity; c.inversion_sum = max; c.weight_rule = CP_WEIGHT_CONTINUOUS;
+        c.operation = op; c.opacity = opacity; c.inversion_sum = max; c.bias = (max + 1) / 2; c.weight_rule = CP_WEIGHT_CONTINUOUS;
         CHECK(cp_process_plane(&c, pa, pb, &pm, nullptr, nullptr, {ref.data(), pitch, sizeof(T)}, rows) == CP_OK);
         for (int alias = 0; alias < 4; ++alias) {
           got = alias == 2 ? b : alias == 3 ? m : a;

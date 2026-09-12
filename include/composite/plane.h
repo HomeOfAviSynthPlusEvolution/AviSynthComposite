@@ -50,6 +50,7 @@ typedef struct cp_plane_config {
 // Q16 for integral inversion_sum in [0,65535], with at most 1 LSB error.
 // Masked integer continuous MIX and INVERT_MIX (inversion_sum == maximum)
 // may round the combined effective weight to Q16, also within 1 LSB.
+// Integer continuous DIFFERENCE with integral bias in [0,65535] also permits 1 LSB.
 // Integer continuous PRODUCT, ADD and SUBTRACT may quantize weights to Q16
 // within 1 LSB, preserving product floor before blending.
 // Mask zero and exact full-weight endpoints remain exact. Noncanonical narrow-U16
