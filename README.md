@@ -1,283 +1,84 @@
 # AviSynth — Composite
 
-Independent image blending and compositing kernels for Merge, Overlay,
-Layer and related channel/mask operations. Public headers are C-compatible;
-implementation is C++17 and builds as the `AviSynth::Composite` static target.
-There is no AviSynth SDK dependency or host integration in this repository.
+**English** | [简体中文](README.zh-CN.md) | [日本語](README.ja.md)
 
-This is an initial development implementation. The public interface may change;
-build matching headers and sources together rather than mixing binary versions.
+AviSynth — Composite is AviSynthMinus's independent image blending and compositing module. It builds without AviSynth and provides kernels for Merge, Overlay, Layer, and related channel and mask operations. It provides ordinary C implementations and cross-platform SIMD kernels using Google Highway.
 
-## Build
+The public interface uses C types and functions; the implementation uses C++17. It has no dependency on the AviSynth SDK, AvsCore, or AvsSimd.
 
-```sh
-cmake --preset dev
-cmake --build --preset dev
-ctest --preset dev
-```
+## Why separate compositing?
 
-CMake 3.24+, a C++17 compiler and Ninja are sufficient. Tests have no downloaded
-dependencies. Embedded builds default tests off; use `CP_BUILD_TESTS` to override.
-With `CP_BUILD_TESTS=ON`, the library and test references disable fused
-multiply-add for reproducible exact comparisons. Production builds use
-`CP_BUILD_TESTS=OFF` and permit fused multiply-add; use a separate Release build
-directory for production.
-The optional `CP_SANITIZERS` switch instruments library and consumers with ASan
-and UBSan on supported non-MSVC Clang/GCC toolchains.
+Separating computational kernels from the frameserver allows their interfaces, numerical behavior, tests, and performance to be maintained independently. The module evolves alongside AviSynthMinus and can be included as a pinned Git submodule for static linking.
 
-Highway 1.4.0 is vendored for offline builds. An existing compatible `hwy` target
-is reused when embedded beside ConvertAudio/ConvertVideo. `CP_SCALAR_ONLY=ON`
-removes both SIMD targets and the Highway dependency entirely.
+The host owns clips, script registration, frame allocation, properties, colorspace interpretation, and scheduling. The library operates on explicit channel views, masks, guides, and row ranges. It supplies building blocks for the host's filters; host integration is maintained separately.
 
-## Backend selection
+## Supported operations
 
-Direct operation functions always use the scalar implementation. Obtain an
-immutable `cp_kernels` table with `cp_get_kernels(cp_choose_target(allowed_bits))`
-to select a backend per instance. Target 0 means C, -1 means native, and positive
-single bits use Highway's target identifiers. No process-wide target override is
-used. Invalid or unsupported explicit targets return null.
+| Area | Capabilities |
+|---|---|
+| Plane blending | Mix, add, subtract, product, inverted-target mix, guided multiply, lighter/darker selection, and biased difference. |
+| Coupled YUV | Full-resolution Add, Subtract, Soft Light, Hard Light, Difference, Exclusion, and Multiply; integer overshoot desaturation. F32 supports Add, Subtract, and Multiply. |
+| Mask and guide sampling | 444, 422, 420, and 411; centered, MPEG2, and top-left placement with signed sampling phase. |
+| Channel utilities | Copy/fill, affine transformation, clamp, RGB luma, color key, and rectangle intersection. |
+| Compatibility | A separate historical Minus integer blend operation. |
 
-The SIMD table covers all nine plane modes, coupled YUV operations, compatibility
-blend, copy/fill, guide resampling, affine/clamp, RGB luma and color key. Stepped
-channels and partial vectors use bounded staging where a direct vector access
-would touch neighboring samples. No padding is required. Targets without FP64
-retain scalar fallback for double-precision arithmetic; other kernels still use
-SIMD. Rectangle intersection is scalar constant-time geometry.
+Storage types are U8/8-bit, U16/9–16-bit, and F32/32-bit. Explicit channel views support planar and stepped packed channels. Alpha is an ordinary channel; weight masks are separate from blend targets. No implicit Porter–Duff equation is applied. Integer samples, masks, and guides must fit the declared bit depth. F32 colors support negative values and HDR; F32 masks must be finite and in [0,1]. See the [public headers](include/composite) for operation-specific restrictions.
 
-Every mode remains available in scalar-only builds. Cache the table after applying
-the host CPU policy; target discovery is unnecessary per frame. SIMD coverage does
-not imply a speedup for every mode or layout; benchmarks are not yet established.
+Numerical behavior follows the reviewed C implementations and regression tests. Eligible integer SIMD paths permit at most **1 LSB per call**; selected F32 paths permit a magnitude-dependent rounding error. Repeated operations can accumulate error. Use ordinary C for reference arithmetic, or increase working bit depth to reduce the normalized size of integer rounding. Exact allowances, endpoints, and fallback conditions are in [Numerical behavior](NUMERICS.md). Matching a filter name does not promise identical output to every historical implementation.
 
-## Interface
+## SIMD and CPU restrictions
 
-Include `composite/composite.h`, or individual operation headers. All images are
-explicit channel views: `stride` is signed bytes between rows and `step` is
-positive bytes between samples. This handles planar channels, BGRA/RGBA channels,
-and YUY2 channels without duplicate arithmetic kernels or a full-frame repack.
-Each pointer denotes logical row zero, including partial row-band execution.
+`CP_TARGET_C` selects ordinary C. `CP_TARGET_NATIVE` selects an available native implementation, falling back to C when necessary. `cp_choose_target(allowed_bits)` selects from compiled targets supported by the CPU and permitted by the caller. `cp_get_kernels` returns an immutable function table; explicit unavailable or invalid targets return null. Targets use Highway bit values. Direct operation functions use ordinary C.
 
-The library provides building blocks with explicit mathematical semantics:
+Selection is per consumer and does not change Highway's process-wide target restrictions. During AviSynth integration, AvsSimd stays in the host, where it interprets `SetMaxCPU` and supplies permitted targets. The host must map `SetMaxCPU("none")` to ordinary C and cache the selected table.
 
-- `cp_process_plane`: weighted/masked mix, addition/subtraction, product,
-  inverted-target mix, luma-guided multiply, threshold selection and biased difference.
-- `cp_process_yuv`: coupled full-resolution YUV artistic operations with AviSynth
-  overshoot desaturation; Soft/Hard Light are AviSynth's additive definitions.
-- `cp_resample_mask`: bounded chroma mask/guide preparation for 444, 422, 420,
-  411, centered/MPEG2/top-left placement and signed sampling phase.
-- Channel copy/fill, affine inversion, explicit clamp, RGB luma, color key and
-  rectangle intersection.
-- `cp_blend_compat`: separate historical Minus integer blend arithmetic.
+SIMD covers pixel operations, including stepped channels and bounded tails without requiring padding. Targets without FP64 retain ordinary C fallback for arithmetic requiring double precision. Rectangle intersection is scalar geometry. Wider SIMD targets do not guarantee higher speed.
 
-Alpha is an ordinary independently addressable channel. Weight masks are separate
-from blend targets, so Layer Subtract can use original alpha as weight and inverted
-alpha as the target. No implicit Porter-Duff alpha equation is substituted.
-Unused channels are left untouched by individual plane calls. For multi-channel
-composition, preserve original guides and weight masks until all dependent channels
-have finished. No function allocates memory or modifies global dispatch state.
+## Building and integration
 
-For unmasked integer `CP_MIX` with `CP_WEIGHT_CONTINUOUS`, SIMD backends may
-round opacity to Q15 (`round(opacity * 32768) / 32768`). Results differ from
-the double scalar reference by at most **1 LSB per call**, including rounding
-boundaries. Unmasked integer continuous `CP_INVERT_MIX` may use Q16 weights
-when `inversion_sum` is integral and in [0,65535], also with at most 1 LSB error.
-Masked integer continuous MIX and INVERT_MIX (`inversion_sum == maximum`)
-may similarly quantize their combined effective weight to Q16 within 1 LSB.
-Exact zero-weight and
-full-weight endpoints are preserved. Integer YUV Overlay Multiply also permits 1 LSB for interior opacity, as
-described below. These allowances do not extend to other operations (except additional integer operations documented below), code weights,
-or F32 except for the separately documented allowances below. Repeated
-operations can accumulate error. Select `CP_TARGET_C` or call `cp_process_plane`
-for reference arithmetic; increasing working bit depth before processing reduces
-the normalized size of a code-value error.
-
-Integer storage is U8/8 or U16/9–16 bits; float storage is F32/32. Float chroma is
-centered at zero; integer chroma is centered at `2^(bits-1)`. Mask channels always
-use nonnegative opacity values, even when attached to chroma. Consult headers for
-supported operations, finite-value requirements, rounding and aliasing rules.
-
-Normal kernels follow reviewed arithmetic, with explicit code-scale weight
-quantization where needed. They do not promise identical output to every historic
-SIMD path. Compatibility is a separate function. Upstream comparisons and local
-research stay outside version control in `tmp/` and `docs/` respectively.
-
-## Kernel benchmarks
-
-Configure with `-DCP_BUILD_BENCHMARKS=ON` in a Release build. Run
-`composite_bench --width 1920 --height 1080 --trials 7 --all-targets` and redirect
-stdout to CSV. Without `--all-targets`, only C and the native target are measured.
-Target numbers are the public Highway bits, with zero denoting C. Workloads
-cover plane mix/product/guided multiply, compat, RGB Layer Add/Mul, YUV artistic
-modes, centered 420 sampling and all pixel utility interfaces, at 8/16/32 bits
-with contiguous and stepped channel views. Use `--workload NAME` to repeat a
-single workload (names appear in the first CSV column). `--opacity W` controls
-blend opacity and `--step 1` restricts runs to contiguous planes. 10-bit storage
-is included alongside 8/16/32 bits in the current matrix.
-
-Optional upstream scalar comparisons are prepared from a local Git repository:
+CMake 3.24 or later and a C++17 compiler are required. The C-compatible interface exposes no STL containers or Highway vector types. Use matching headers and libraries: the interface may evolve and does not promise binary interchangeability between releases.
 
 ```sh
-python benchmarks/prepare_upstream.py ../AviSynthMinus --ref upstream/master
-cmake -S . -B build/benchmark -DCP_BUILD_BENCHMARKS=ON -DCMAKE_BUILD_TYPE=Release \
-  -DCP_UPSTREAM_BENCH_DIR=/absolute/path/to/AviSynthComposite/tmp/benchmark-upstream
-cmake --build build/benchmark --config Release
+cmake -S . -B build/release -DCMAKE_BUILD_TYPE=Release -DCP_BUILD_TESTS=ON
+cmake --build build/release --config Release --parallel
+ctest --test-dir build/release -C Release --output-on-failure
 ```
 
-The extractor records the resolved commit and retains upstream notices in ignored
-temporary headers. It does not fetch; update the local ref explicitly when desired.
-These comparisons measure actual Layer Add/Mul scalar templates, with compiler
-auto-vectorization enabled, not upstream hand-written SIMD or complete filters.
-For `--workload mix --opacity 0.5 --step 1`, x86 builds additionally compare the
-actual upstream AVX2 average core when the AVX2 target is supported. Its source
-is extracted to the temporary directory and compiled separately with AVX2 enabled;
-the benchmark driver retains its baseline instruction set. This reference applies
-to unmasked averaging. Non-half, non-endpoint unmasked MIX additionally compares
-upstream's shared Merge/Overlay weighted AVX2 core. Integer comparisons require
-an exactly representable k/32768 opacity and bit-exact outputs; other integer
-weights are skipped rather than quantized. Float comparisons permit 2e-7 absolute
-error on normalized finite inputs, not a general float error guarantee. The
-weighted float core requires FMA, included in Highway's AVX2 target requirements.
-For masked `code_mix` (or float `mix`), the MASK444 upstream AVX2 comparison
-includes upstream row preparation and scratch allocation inside the timed call.
-Integer code weights must match exactly; continuous integer mask weights have a
-different contract and are not compared to this reference. Float comparisons use
-the normalized-input tolerance above. `sample420` additionally compares the full-opacity upstream CENTER box row core.
-Integer outputs must match exactly. Upstream float SIMD groups its additions
-differently from its scalar tail; comparison allows 2e-7 on normalized inputs,
-while our kernels retain the scalar tap order bit-for-bit. Other subsampled mask
-modes are not yet compared to upstream. Use `--bits 8|10|16|32` to focus the format
-without changing the workload or validation.
-RGB comparisons process three channels; optional source alpha weights all three
-without modifying alpha. Stepped single-channel tests do not grant access to other
-channels and are not a fused packed-RGBA benchmark.
-Use `--packed` to place all four channels in a single interleaved RGBA allocation
-with a four-sample pixel step. This differs from `--step 4`, which uses four
-separate sparse planes and has a larger working set. The CSV `layout` column
-identifies `packed` or `separate`; compare like layouts. Packed runs validate the
-entire allocation, including untouched channels, and omit contiguous upstream
-references. For example:
+Tests have no downloaded dependencies. Use `-DCP_BUILD_TESTS=OFF` for a library-only build; embedded builds default tests off. `-DCP_SCALAR_ONLY=ON` removes SIMD and the Highway dependency. Optional benchmarks use `-DCP_BUILD_BENCHMARKS=ON`. `-DCP_SANITIZERS=ON` enables ASan/UBSan on supported non-MSVC Clang/GCC toolchains.
 
-```sh
-composite_bench --workload key --bits 32 --packed --trials 11 > tmp/packed-key.csv
+The static library is `Composite`; its CMake alias is `AviSynth::Composite`. After adding the repository as a submodule, link the target directly:
+
+```cmake
+add_subdirectory(third_party/composite)
+target_link_libraries(MyHost PRIVATE AviSynth::Composite)
 ```
 
-`code_guided` measures the code-weight guided multiply path with an integral
-chroma neutral (or zero for float); `guided` retains continuous weights and its
-existing half-maximum neutral. These are distinct arithmetic contracts.
+Standalone builds use vendored Highway 1.4.0. Embedded builds reuse an existing compatible `hwy` target so Audio, Video, and the host can share one runtime. CMake propagates static link dependencies; consumers do not enumerate kernel sources. The supported integration is a joint CMake build, not an installed binary SDK package.
 
-Inputs are deterministic. Before timing, every backend is checked against the C
-reference, including untouched samples; local backends must be bit-exact except
-for the documented 1 LSB allowance for integer continuous MIX and
-INVERT_MIX, and integer Overlay Multiply. Upstream
-integer Layer results must be exact and float results within 2e-7 (the existing
-Layer fixture tolerance). Any mismatch fails the run. Each timed call follows a
-reset from the same base, with two warmups and the requested measured trials;
-reset, allocation, validation and checksum are excluded from timing. CSV reports
-min/median/max milliseconds and processed samples per second. Resetting warms
-memory, so these are kernel microbenchmarks, not cold-cache streaming throughput.
-Record CPU, compiler, build flags and Git revision alongside results. Run benchmarks
-alone rather than concurrently with builds/tests, and repeat before judging small
-differences.
+Public headers are under [include/composite](include/composite). Strides are signed byte counts; sample steps are positive byte counts. Follow each API's row-origin, overlap, and lifetime contracts. Pixel operations allocate no memory. Preserve original guides and masks until dependent channel operations finish. Independent calls into disjoint output regions can run concurrently.
 
-### Batched average comparison
+## Testing and performance
 
-`composite_average_bench` focuses on contiguous 16-bit, 50% unmasked MIX of a
-1920x1080 single plane. It compares the native target, AVX2 when available, and
-the extracted upstream AVX2 core when configured above.
+Independent tests cover arithmetic, compatibility, sampling, channel utilities, C/SIMD comparisons, numerical boundaries, irregular sizes, signed strides, row bands, concurrency, and memory boundaries. A C consumer checks the public interface. The suite contains 15 CTest entries, with multiple cases and targets exercised internally.
 
-```sh
-composite_average_bench --slots 1 --batch 64 --rounds 30 > tmp/average-hot.csv
-composite_average_bench --slots 8 --batch 64 --rounds 30 > tmp/average-ring.csv
-python benchmarks/summarize_average.py tmp/average-hot.csv
-python benchmarks/summarize_average.py tmp/average-ring.csv
-```
+CI covers Windows, Linux, and macOS with SIMD and ordinary C configurations, additional Windows Win32 builds, and Linux ASan/UBSan. Additional correctness and performance testing has covered Linux and FreeBSD on x86-64 and ARM64. Kernel validation does not replace host filter integration tests.
 
-After a one-second initial warmup, each block restores deterministic inputs,
-performs two warmup passes over the frame ring, then times 64 calls together.
-Only the calls are timed. All output is independently validated after each block.
-Backends rotate through execution positions, with a seeded shuffle between groups;
-30 rounds provide paired comparisons. Raw CSV retains every block. The summary
-reports median, p10/p90, relative median absolute deviation, and paired ratios to
-upstream. Bootstrap intervals are exploratory: successive rounds can share clock
-or thermal drift and are not necessarily statistically independent.
+With tests enabled, the build disables implicit floating-point contraction for reproducible reference comparisons; explicit SIMD fused operations can still be used. Library-only builds permit contraction. Record this option when comparing results.
 
-One slot has a 7.91 MiB source/output working set; eight have 63.28 MiB at the
-default dimensions. Base snapshots require additional memory outside timing.
-These are warmed repeated-frame and larger rotating-frame workloads, respectively,
-not guaranteed cold-cache tests. Averaging updates the destination in place and
-converges toward the source during each block. This is appropriate for this
-data-independent integer kernel, not a general recipe for value-dependent kernels.
-Results include our public dispatch/validation but upstream's direct core wrapper;
-neither includes complete filter/frame-management overhead. Pin to the same CPU,
-run without concurrent builds/tests, and repeat in separate processes before
-interpreting small differences. Do not compare these timings directly with the
-single-call benchmark, whose resets and checks produce different cache conditions.
+Optional benchmarks validate output against C before timing and report minimum, median, and maximum milliseconds. They cover 8-, 10-, 16-, and 32-bit inputs, contiguous and stepped channels, and packed layouts. Selected upstream kernels can be extracted from a local checkout. See [Kernel benchmarks](benchmarks/README.md) for commands, timing scope, and reference restrictions.
 
-### Additional compositing comparisons
+Compare equivalent inputs, layouts, build options, CPU restrictions, and timing scopes. Kernel-only timings and complete-filter timings are different measurements. Performance reports should include output comparisons as well as timings; small differences require proportionate verification.
 
-`overlay_mul` measures fused full-resolution YUV Multiply through
-`CP_YUV_MULTIPLY`, equivalent to continuous `CP_GUIDED_MULTIPLY` on each plane
-with source Y as the shared guide. It validates against the independent C path.
-The optional upstream integer AVX2 core uses binary32 internally; its benchmark
-comparison permits one output code difference and reports the observed maximum.
-This tolerance applies to this bounded integer operation, not other kernels.
+## Development and contributions
 
-Integer `yuv_add` and `yuv_subtract` also compare actual upstream scalar templates,
-with a minimal frame-view stand-in and no AviSynth SDK. Their outputs must match
-exactly. The reference is enabled only when opacity is exactly representable as
-binary32, avoiding a hidden parameter conversion. These are scalar templates
-with compiler auto-vectorization enabled, not upstream handwritten SIMD.
+The maintainer directs development, reviews changes, and is responsible for releases. Bug reports, suggestions, and contributions are welcome. Discuss numerical semantics, public interface changes, and substantial architectural changes before implementation.
 
-## License and attribution
+This project uses AI-assisted implementation, tests, and review. Contributions should explain the problem, approach, validation, and how AI was involved. Reports should include the commit, OS, CPU, compiler, build options, input/output formats, and a minimal reproducer; performance reports should also describe dimensions, CPU targets, and the measurement method.
 
-GPL version 2 or later, retaining the inherited AviSynth linking exception; see
-[LICENSE](LICENSE). Algorithms and behavior were studied in AviSynth/AviSynth+ and
-AviSynthMinus. Original AviSynth copyright includes Ben Rudiak-Gould and other
-contributors; Overlay was originally written by Klaus Post (2003–2004). This
-implementation also draws on the subsequent AviSynth+ contributors' fixes and
-semantic clarifications. No upstream golden source is distributed in this tree.
+## Acknowledgments and license
 
-Integer YUV Overlay Multiply may use binary32 SIMD for interior opacity
-(0 < opacity < 1). For canonical input codes, the final output differs
-from the scalar reference by at most 1 LSB. Zero and full opacity retain their
-existing exact behavior. F32 has the separate allowance below.
+This module builds on AviSynth, AviSynth+, AviSynthMinus, and their contributors, and uses Google Highway for SIMD. Thanks to the original authors and everyone contributing tests, reports, and improvements.
 
-Integer continuous PRODUCT may quantize its blend weight to Q16, with at most
-1 LSB output difference. The product is still floored before blending.
+Thanks to [SB.SB](https://sb.sb) for sponsoring the LLM subscription used in this project's development.
 
-Integer continuous ADD and SUBTRACT may quantize the effective weight to Q16.
-The final clipped output differs by at most 1 LSB; exact zero/full-weight endpoints remain exact.
-
-Integer continuous DIFFERENCE may use Q16 weights when bias is an integer in
-[0, 65535]. Its final clipped result differs by at most 1 LSB. Fractional or
-out-of-range bias retains reference arithmetic.
-
-Integer continuous GUIDED_MULTIPLY may use float SIMD for 0 < opacity < 1
-and neutral in [0, maximum]. Final output differs by at most 1 LSB. Full
-opacity and out-of-range neutral retain the
-reference calculation; zero mask preserves the original code exactly.
-
-Integer input samples, guides and masks must fit the declared bit depth, as
-required by `types.h` (10-bit: 0..1023, not the narrower video limited range).
-SIMD kernels do not scan for violations or guarantee scalar-equivalent results
-for them. Geometry and descriptor validation, and bounds-safe access, remain
-unchanged. F32 color excursions remain supported under their existing contract.
-
-F32 SIMD masked MIX and PRODUCT on continuous planes, and YUV Overlay Multiply
-on continuous planes with no mask or one shared mask, may use binary32
-arithmetic for every opacity in (0,1], including negative colors and HDR.
-The allowed error against the scalar result is
-`16 * FLT_EPSILON * max(1, S)`, with double-precision weight
-`w = opacity * mask` (or `opacity` without a mask):
-
-- MIX: `S = abs(a)*(1-w) + abs(b)*w`.
-- PRODUCT: `S = abs(a)*((1-w) + abs(b)*w)`.
-- YUV Multiply uses the PRODUCT scale for each base channel with source Y as `b`.
-
-For normalized nonnegative inputs this is at most 1.91e-6, or 0.125 of a
-16-bit code. This is an error allowance, not a claim that all cases reach it.
-Zero mask copies input bits, and full-weight endpoints retain reference semantics.
-Both F32 weight rules share this allowance; integer CODE behavior is unchanged.
-Nonfinite inputs or results, results within 64 float epsilons of overflow, and
-near-full blends whose base exceeds `2^20 * max(1, abs(candidate))` retain the
-reference calculation for the vector block. Other layouts retain existing kernels.
-Use `cp_process_plane`, `cp_process_yuv`, or `CP_TARGET_C` for reference arithmetic.
+The project uses GPL version 2 or later with the inherited AviSynth linking exception, retaining its original wording and scope. See [LICENSE](LICENSE). Source files retain their copyright notices; third-party components have their own licenses. Providing a new C interface does not expand the inherited exception.
