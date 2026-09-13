@@ -1167,10 +1167,17 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       auto vy = blend(original_y, 0);
       const auto vu = blend(original_u, 1), vv = blend(original_v, 2);
       const auto overflow = add ? hn::Gt(vy, one) : hn::Lt(vy, zero);
-      const auto fade = add ? hn::Div(hn::Sub(upper_limit, vy), over) : hn::Add(one, hn::Div(vy, over));
-      // Ordered comparisons reproduce std::max(0, NaN), and avoid clamping
-      // the opposite luma endpoint (float Add/Subtract deliberately differ).
-      const auto keep = hn::IfThenElse(overflow, hn::IfThenElse(hn::Gt(fade, zero), fade, zero), one);
+      auto keep = one;
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+      // No desaturation is needed unless luma overflows. Avoid a vector double
+      // division for ordinary pixels; compute the original expression otherwise.
+      if (!masked || !hn::AllFalse(d, overflow))
+#endif
+      {
+        const auto fade = add ? hn::Div(hn::Sub(upper_limit, vy), over) : hn::Add(one, hn::Div(vy, over));
+        // Preserve ordered NaN comparisons and the original luma clamp order.
+        keep = hn::IfThenElse(overflow, hn::IfThenElse(hn::Gt(fade, zero), fade, zero), one);
+      }
       vy = hn::IfThenElse(overflow, add ? one : zero, vy);
       const auto desaturate = [&](auto value, auto keep) HWY_ATTR {
         const auto zero = hn::Zero(d), one = hn::Set(d, 1);
