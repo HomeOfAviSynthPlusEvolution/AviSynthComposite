@@ -1475,6 +1475,34 @@ void UnaryRows(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, doub
       }
       return;
     }
+    // Keep binary64 arithmetic, but separate complete contiguous vectors from
+    // sparse samples and tails. No layout/count checks belong in the hot loop.
+    const hn::ScalableTag<double> d;
+    const hn::Rebind<float, decltype(d)> df;
+    const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+    const auto a = hn::Set(d, first), b = hn::Set(d, second);
+    const bool contiguous = source.step == sizeof(float) && out.step == sizeof(float);
+    const ptrdiff_t input_step = source.step, output_step = out.step;
+    for (int y = r.first; y < r.first + r.count; ++y) {
+      const auto* src = address(source, 0, y);
+      auto* dst = address(out, 0, y);
+      size_t x = 0;
+      if (contiguous) {
+        const auto* input = reinterpret_cast<const float*>(src);
+        auto* output = reinterpret_cast<float*>(dst);
+        for (; x < end; x += n) {
+          const auto value = hn::PromoteTo(d, hn::LoadU(df, input + x));
+          hn::StoreU(hn::DemoteTo(df, hn::Add(hn::Mul(value, a), b)), df, output + x);
+        }
+      }
+      for (; x < width; ++x) {
+        float value;
+        std::memcpy(&value, src + ptrdiff_t(x) * input_step, sizeof(value));
+        value = static_cast<float>(double(value) * first + second);
+        std::memcpy(dst + ptrdiff_t(x) * output_step, &value, sizeof(value));
+      }
+    }
+    return;
   }
   if constexpr (!std::is_same<T, float>::value) {
     const double maximum = cp::maximum(f);
