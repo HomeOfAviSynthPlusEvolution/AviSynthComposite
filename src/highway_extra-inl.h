@@ -1410,6 +1410,32 @@ void ScatterFloat(hn::VFromD<D> value, D d, float* p, hn::VFromD<hn::Rebind<int3
 #if HWY_HAVE_FLOAT64
 template <class T, bool Clamp>
 void UnaryRows(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, double first, double second) {
+  if constexpr (!Clamp && std::is_same<T, float>::value) {
+    if (first == -1 && second == 1) {
+      // Exact binary32 inversion: avoid promotion, multiplication and demotion.
+      // Sparse views authorize only their selected samples, not adjacent lanes.
+      const hn::ScalableTag<float> d;
+      const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+      const auto one = hn::Set(d, 1.0f);
+      const bool contiguous = source.step == sizeof(float) && out.step == sizeof(float);
+      for (int y = r.first; y < r.first + r.count; ++y) {
+        size_t x = 0;
+        if (contiguous) {
+          const auto* src = reinterpret_cast<const float*>(address(source, 0, y));
+          auto* dst = reinterpret_cast<float*>(address(out, 0, y));
+          for (; x < end; x += n)
+            hn::StoreU(hn::Sub(one, hn::LoadU(d, src + x)), d, dst + x);
+        }
+        for (; x < width; ++x) {
+          float value;
+          std::memcpy(&value, address(source, static_cast<int>(x), y), sizeof(value));
+          value = 1.0f - value;
+          std::memcpy(address(out, static_cast<int>(x), y), &value, sizeof(value));
+        }
+      }
+      return;
+    }
+  }
   if constexpr (!std::is_same<T, float>::value) {
     const double maximum = cp::maximum(f);
     if (Clamp || (first == -1 && second == maximum)) {

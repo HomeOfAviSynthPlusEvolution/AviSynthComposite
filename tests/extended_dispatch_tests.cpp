@@ -653,6 +653,28 @@ void IntegerClampLimits(const cp_kernels* k, int bits) {
   same(inverted, expected, "integer inversion in-place declared-depth codes");
 }
 
+void FloatInversion(const cp_kernels* k) {
+  const float samples[] = {0.f, -0.f, 1.f, std::nextafter(1.f, 0.f), std::nextafter(1.f, 2.f),
+                           -1.f, 100.f, -100.f, 1.f / 65535, -1.f / 65535, INFINITY, -INFINITY, NAN};
+  for (int width : {1, 7, 16, 31, 65, 129})
+    for (int step : {1, 4})
+      for (bool negative : {false, true}) {
+        Image<float> input(width, 4, step, negative), got = input, ref = input;
+        for (int y = 0; y < input.h; ++y)
+          for (int x = 0; x < width; ++x)
+            input.data[input.origin + y * input.pitch + x * step] = samples[(x + y) % 13];
+        const cp_rows band{width, 4, 1, 2};
+        CHECK(k->affine(format(32), input.in(), got.out(), band, -1, 1) == CP_OK);
+        CHECK(cp_affine(format(32), input.in(), ref.out(), band, -1, 1) == CP_OK);
+        same(got, ref, "float inversion boundaries and row band");
+        got = input;
+        ref = input;
+        CHECK(k->affine(format(32), got.in(), got.out(), band, -1, 1) == CP_OK);
+        CHECK(cp_affine(format(32), ref.in(), ref.out(), band, -1, 1) == CP_OK);
+        same(got, ref, "float inversion in-place");
+      }
+}
+
 template <class T>
 void IntegerYuvEdges(const cp_kernels* k, int bits) {
   const int width = bits == 8 ? 65536 : 4097;
@@ -819,6 +841,7 @@ int main() {
     for (int bits = 9; bits <= 16; ++bits)
       IntegerKeyThresholds<uint16_t>(k, bits);
     FloatKeyThresholds(k);
+    FloatInversion(k);
     FloatSteppedViews(k);
     FloatMultiplySpecials(k);
     FloatYuvEdges(k);
