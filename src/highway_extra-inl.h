@@ -1049,7 +1049,8 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
       auto guide = hn::Zero(d);
       if constexpr (operation == CP_YUV_EXCLUSION)
         guide = hn::PromoteTo(d, load(b[0]));
-      for (int p = 0; p < 3; ++p) {
+      const auto channel = [&](auto index) HWY_ATTR {
+        const int p = index;
         const auto av = hn::PromoteTo(di, load(a[p]));
         const auto bv = hn::PromoteTo(di, load(b[p]));
         const auto weight =
@@ -1074,7 +1075,18 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
         quotient = hn::Add(quotient, hn::IfThenElse(large, weight, hn::Zero(d)));
         const auto rounded = hn::BitCast(di, quotient);
         const auto delta = hn::IfThenElse(hn::Lt(difference, zero), hn::Neg(rounded), rounded);
-        VectorChannel(v_0, v_1, v_2, p) = hn::Add(av, delta);
+        return hn::Add(av, delta);
+      };
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+      if constexpr (operation == CP_YUV_DIFFERENCE || operation == CP_YUV_EXCLUSION) {
+        v_0 = channel(std::integral_constant<int, 0>{});
+        v_1 = channel(std::integral_constant<int, 1>{});
+        v_2 = channel(std::integral_constant<int, 2>{});
+      } else
+#endif
+      {
+        for (int p = 0; p < 3; ++p)
+          VectorChannel(v_0, v_1, v_2, p) = channel(p);
       }
       const auto upper = hn::Sub(hn::Set(di, Signed(maximum + 1 + over_code)), v_0);
       const auto lower = hn::Add(over, v_0);
