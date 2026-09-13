@@ -2,6 +2,7 @@
 """Collect a small, resumable cross-platform sample using the production benchmark."""
 import argparse
 import csv
+import hashlib
 import io
 import json
 from pathlib import Path
@@ -24,10 +25,20 @@ def main():
     metadata = {"label": args.label, "revision": args.revision,
                 "system": platform.platform(), "machine": platform.machine(),
                 "benchmark": str(Path(args.bench).resolve()), "trials": 5,
-                "all_targets": args.all_targets, "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
-    (output / "metadata.json").write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+                "all_targets": args.all_targets, "workloads": sorted(args.workload or []),
+                "benchmark_sha256": hashlib.sha256(Path(args.bench).read_bytes()).hexdigest(),
+                "started_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime())}
     workloads = ("mix", "overlay_mul", "sample420", "affine", "clamp",
                  "continuous_product", "continuous_add", "luma", "copy")
+    if args.workload and any(w not in workloads for w in args.workload):
+        parser.error("unknown workload")
+    manifest = output / "metadata.json"
+    if manifest.exists():
+        previous = json.loads(manifest.read_text(encoding="utf-8"))
+        identity = ("revision", "all_targets", "workloads", "benchmark_sha256")
+        if any(previous.get(k) != metadata[k] for k in identity):
+            parser.error("output belongs to a different build or collection; choose a new output directory")
+    manifest.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
     statuses = []
     combined = []
     for workload in workloads:
