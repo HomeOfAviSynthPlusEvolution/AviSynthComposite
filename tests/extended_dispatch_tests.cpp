@@ -653,6 +653,25 @@ void IntegerClampLimits(const cp_kernels* k, int bits) {
   same(inverted, expected, "integer inversion in-place declared-depth codes");
 }
 
+void FloatSteppedBox(const cp_kernels* k) {
+  const float samples[] = {0.f, -0.f, 1.f, -1.f, 100.f, -100.f, 1.f / 65535, -1.f / 65535,
+                           INFINITY, -INFINITY, NAN};
+  for (int source_step : {1, 4})
+    for (int output_step : {1, 4})
+      for (bool negative : {false, true})
+        for (int vertical : {1, 2}) {
+          Image<float> input(133, 6, source_step, negative), got(65, 3, output_step, !negative), ref = got;
+          for (int y = 0; y < input.h; ++y)
+            for (int x = 0; x < input.w; ++x)
+              input.data[input.origin + y * input.pitch + x * source_step] = samples[(x + y * 3) % 11];
+          const cp_sampling sampling{133, 6, 2, vertical, CP_CENTER, 1, 0};
+          const cp_rows band{65, 3, 1, 2};
+          CHECK(k->resample_mask(format(32), input.in(), got.out(), &sampling, band) == CP_OK);
+          CHECK(cp_resample_mask(format(32), input.in(), ref.out(), &sampling, band) == CP_OK);
+          same(got, ref, "float box mixed strides HDR and exceptional samples");
+        }
+}
+
 void FloatInversion(const cp_kernels* k) {
   const float samples[] = {0.f, -0.f, 1.f, std::nextafter(1.f, 0.f), std::nextafter(1.f, 2.f),
                            -1.f, 100.f, -100.f, 1.f / 65535, -1.f / 65535, INFINITY, -INFINITY, NAN};
@@ -842,6 +861,7 @@ int main() {
       IntegerKeyThresholds<uint16_t>(k, bits);
     FloatKeyThresholds(k);
     FloatInversion(k);
+    FloatSteppedBox(k);
     FloatSteppedViews(k);
     FloatMultiplySpecials(k);
     FloatYuvEdges(k);

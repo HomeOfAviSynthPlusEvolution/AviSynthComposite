@@ -133,19 +133,22 @@ void run(const cp_kernels* k, int bits, int width, int step, bool negative) {
 }
 // Full interior box rows end exactly at a guard page, including SIMD tails.
 template <class T>
-void box_sampling(const cp_kernels* k, int bits, int width, bool negative) {
-  const size_t row_bytes = size_t(width) * 2 * sizeof(T);
-  Guarded source(row_bytes * 2, !negative), out(size_t(width) * sizeof(T));
+void box_sampling(const cp_kernels* k, int bits, int width, bool negative, int step = 1) {
+  const size_t row_bytes = (size_t(width * 2 - 1) * step + 1) * sizeof(T);
+  const size_t output_samples = size_t(width - 1) * step + 1;
+  Guarded source(row_bytes * 2, !negative), out(output_samples * sizeof(T));
+  std::memset(out.data, 0, out.size);
   const T maximum = bits == 32 ? T(1) : T((1u << bits) - 1);
   for (int i = 0; i < width * 4; ++i) {
     const T value = i % 5 == 0 ? maximum : T(i % 7);
-    std::memcpy(source.data + size_t(i) * sizeof(T), &value, sizeof(T));
+    const size_t offset = size_t(i / (width * 2)) * row_bytes + size_t(i % (width * 2)) * step * sizeof(T);
+    std::memcpy(source.data + offset, &value, sizeof(T));
   }
   const cp_const_plane input{source.data + (negative ? row_bytes : 0),
-                             negative ? -ptrdiff_t(row_bytes) : ptrdiff_t(row_bytes), sizeof(T)};
-  const cp_plane output{out.data, ptrdiff_t(out.size), sizeof(T)};
-  std::vector<T> reference(width);
-  const cp_plane expected{reference.data(), ptrdiff_t(out.size), sizeof(T)};
+                             negative ? -ptrdiff_t(row_bytes) : ptrdiff_t(row_bytes), step * ptrdiff_t(sizeof(T))};
+  const cp_plane output{out.data, ptrdiff_t(out.size), step * ptrdiff_t(sizeof(T))};
+  std::vector<T> reference(output_samples);
+  const cp_plane expected{reference.data(), ptrdiff_t(out.size), step * ptrdiff_t(sizeof(T))};
   const cp_format f{bits == 32 ? CP_F32 : bits == 8 ? CP_U8 : CP_U16, bits};
   for (int vertical : {1, 2}) {
     const cp_sampling sampling{width * 2, 2, 2, vertical, CP_CENTER, 0, 0};
@@ -271,6 +274,7 @@ int main() {
         for (int bits = 9; bits <= 16; ++bits)
           box_sampling<uint16_t>(cp_get_kernels(target), bits, width, negative);
         box_sampling<float>(cp_get_kernels(target), 32, width, negative);
+        box_sampling<float>(cp_get_kernels(target), 32, width, negative, 4);
       }
   for (auto target : targets)
     for (int width : {1, 3, 7, 15, 16, 17, 31, 32, 33, 65})

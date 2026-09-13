@@ -1306,6 +1306,46 @@ void BoxRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_rows 
 
 template <class T>
 void SampleRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_rows r) {
+  if constexpr (std::is_same<T, float>::value) {
+    if ((source.step != sizeof(T) || out.step != sizeof(T)) && s->placement == CP_CENTER && s->subsample_x == 2 &&
+        s->origin_x >= 0 && int64_t(s->origin_x) + int64_t(r.width) * 2 <= s->source_width &&
+        int64_t(s->origin_y) + int64_t(r.first) * s->subsample_y >= 0 &&
+        int64_t(s->origin_y) + int64_t(r.first + r.count) * s->subsample_y <= s->source_height) {
+      // The complete box is interior. Read only the selected samples; staging
+      // four separate tap vectors costs more than the arithmetic on sparse views.
+      const auto box = [&](auto vertical) HWY_ATTR {
+        const int width = r.width, first = r.first, end = r.first + r.count;
+        const int origin_x = s->origin_x, origin_y = s->origin_y;
+        const ptrdiff_t input_step = source.step, output_step = out.step;
+        for (int y = first; y < end; ++y) {
+          const int sy = static_cast<int>(int64_t(origin_y) + int64_t(y) * decltype(vertical)::value);
+          const auto* row0 = address(source, origin_x, sy);
+          const auto* row1 = decltype(vertical)::value == 2 ? address(source, origin_x, sy + 1) : row0;
+          auto* destination = address(out, 0, y);
+          for (int x = 0; x < width; ++x) {
+            const ptrdiff_t offset = ptrdiff_t(x * 2) * input_step;
+            float a, b;
+            std::memcpy(&a, row0 + offset, sizeof(a));
+            std::memcpy(&b, row0 + offset + input_step, sizeof(b));
+            float value = a + b;
+            if constexpr (decltype(vertical)::value == 2) {
+              float c, e;
+              std::memcpy(&c, row1 + offset, sizeof(c));
+              std::memcpy(&e, row1 + offset + input_step, sizeof(e));
+              value = ((value + c) + e) * .25f;
+            } else
+              value *= .5f;
+            std::memcpy(destination + ptrdiff_t(x) * output_step, &value, sizeof(value));
+          }
+        }
+      };
+      if (s->subsample_y == 2)
+        box(std::integral_constant<int, 2>{});
+      else
+        box(std::integral_constant<int, 1>{});
+      return;
+    }
+  }
   if (source.step == sizeof(T) && out.step == sizeof(T) && s->placement == CP_CENTER && s->subsample_x == 2 &&
       s->origin_x >= 0 && int64_t(s->origin_x) + int64_t(r.width) * 2 <= s->source_width &&
       int64_t(s->origin_y) + int64_t(r.first) * s->subsample_y >= 0 &&
