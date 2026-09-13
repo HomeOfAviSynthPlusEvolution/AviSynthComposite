@@ -50,6 +50,8 @@ typedef struct cp_plane_config {
 // Q16 for integral inversion_sum in [0,65535], with at most 1 LSB error.
 // Masked integer continuous MIX and INVERT_MIX (inversion_sum == maximum)
 // may round the combined effective weight to Q16, also within 1 LSB.
+// NEON U8 MIX/INVERT_MIX/PRODUCT may instead round the combined weight
+// to one byte, using Q15 opacity evaluation; the same 1 LSB bound applies.
 // Integer continuous GUIDED_MULTIPLY also permits 1 LSB for interior opacity
 // and neutral in [0, maximum].
 // Integer continuous DIFFERENCE with integral bias in [0,65535] also permits 1 LSB.

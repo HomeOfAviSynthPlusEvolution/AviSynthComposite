@@ -181,6 +181,48 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
   return CP_OK;
 }
 
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+template <int operation, bool masked>
+HWY_NOINLINE int NarrowContinuousU8(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
+                                    cp_const_plane mask, cp_plane output, cp_rows r) {
+  const hn::ScalableTag<uint16_t> d;
+  const hn::Rebind<int16_t, decltype(d)> di;
+  const hn::Rebind<uint8_t, decltype(d)> dt;
+  // Q15 opacity error is <= 1/32768 (including the signed upper clamp).
+  // Rounding mask*opacity to one byte adds <= .5/255 to the weight:
+  // the U8 output perturbation is <= .5 + 255/32768 < .508 codes.
+  const int16_t opacity = int16_t(std::min(32767.0, std::floor(c->opacity * 32768 + .5)));
+  const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+  const bool contiguous = a.step == 1 && b.step == 1 && output.step == 1 && (!masked || mask.step == 1);
+  const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
+    const auto av = hn::PromoteTo(d, ac);
+    auto bv = hn::PromoteTo(d, bc);
+    if constexpr (operation == CP_PRODUCT)
+      bv = DivideCode(d, hn::Mul(av, bv), 8);
+    else if constexpr (operation == CP_INVERT_MIX)
+      bv = hn::Sub(hn::Set(d, 255), bv);
+    const auto weight = hn::BitCast(d, hn::MulFixedPoint15(hn::PromoteTo(di, mc), hn::Set(di, opacity)));
+    const auto sum = hn::Add(hn::Add(hn::Mul(av, hn::Sub(hn::Set(d, 255), weight)), hn::Mul(bv, weight)), hn::Set(d, 127));
+    return hn::DemoteTo(dt, DivideCode(d, sum, 8));
+  };
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    size_t x = 0;
+    if (contiguous) {
+      const auto* ap = address(a, 0, y); const auto* bp = address(b, 0, y);
+      const auto* mp = masked ? address(mask, 0, y) : nullptr; auto* dst = address(output, 0, y);
+      for (; x < end; x += n)
+        hn::StoreU(blend(hn::LoadU(dt, ap + x), hn::LoadU(dt, bp + x), masked ? hn::LoadU(dt, mp + x) : hn::Set(dt, 255)), dt, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      StoreChannel(blend(LoadChannel(dt, a, int(x), y, count), LoadChannel(dt, b, int(x), y, count),
+                         masked ? LoadChannel(dt, mask, int(x), y, count) : hn::Set(dt, 255)), dt, output, int(x), y, count);
+    }
+  }
+  return CP_OK;
+}
+#endif
+
 // Quantize the combined continuous weight once, not opacity and mask separately.
 // For canonical codes, float multiplication plus Q16 rounding contributes less
 // than 0.51 output codes at 16 bits. Integer accumulation is exact and bounded
@@ -188,6 +230,10 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
 template <class T, bool invert>
 HWY_NOINLINE int MaskedContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
                                      cp_const_plane mask, cp_plane output, cp_rows r) {
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+  if constexpr (std::is_same<T, uint8_t>::value)
+    return NarrowContinuousU8<invert ? CP_INVERT_MIX : CP_MIX, true>(c, a, b, mask, output, r);
+#endif
   const hn::ScalableTag<uint32_t> d;
   const hn::Rebind<T, decltype(d)> dt;
   const hn::Rebind<float, decltype(d)> df;
@@ -232,6 +278,10 @@ HWY_NOINLINE int MaskedContinuousRows(const cp_plane_config* c, cp_const_plane a
 template <class T, bool masked>
 HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
                                      cp_const_plane mask, cp_plane output, cp_rows r) {
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+  if constexpr (std::is_same<T, uint8_t>::value)
+    return NarrowContinuousU8<CP_PRODUCT, masked>(c, a, b, mask, output, r);
+#endif
   const hn::ScalableTag<uint32_t> d;
   const hn::Rebind<T, decltype(d)> dt;
   const hn::Rebind<float, decltype(d)> df;

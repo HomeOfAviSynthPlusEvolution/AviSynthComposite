@@ -122,7 +122,37 @@ void VerifyQ15Differences() {
   }
 }
 
+void VerifyNarrowContinuous() {
+  constexpr int n = 65536;
+  std::vector<uint8_t> a(n), b(n), m(n), out(n);
+  for (int i = 0; i < n; ++i) { a[i] = uint8_t(i / 256); b[i] = uint8_t(i % 256); }
+  const cp_const_plane pa{a.data(), n, 1}, pb{b.data(), n, 1}, pm{m.data(), n, 1};
+  const cp_plane po{out.data(), n, 1};
+  for (auto remaining = cp_supported_targets(); remaining; remaining &= remaining - 1) {
+    const auto* k = cp_get_kernels(remaining & -remaining);
+    for (double opacity : {.003, .17, .625, std::nextafter(1.0, 0.0), 1.0})
+      for (int mask : {0, 1, 127, 128, 254, 255}) {
+        std::fill(m.begin(), m.end(), uint8_t(mask));
+        for (int op : {CP_MIX, CP_PRODUCT, CP_INVERT_MIX}) {
+          const cp_plane_config c{{CP_U8, 8}, op, opacity, 0, 255, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+          if (k->process_plane(&c, pa, pb, &pm, nullptr, nullptr, po, {n, 1, 0, 1}) != CP_OK) std::abort();
+          for (int i = 0; i < n; ++i) {
+            const int target = op == CP_PRODUCT ? int(a[i]) * b[i] / 255 : op == CP_INVERT_MIX ? 255 - b[i] : b[i];
+            const double weight = opacity * (mask / 255.0);
+            const int expected = int(std::floor(a[i] + (target - a[i]) * weight + .5));
+            const int tolerance = mask == 0 || (opacity == 1 && mask == 255) ? 0 : 1;
+            if (std::abs(int(out[i]) - expected) > tolerance) {
+              std::fprintf(stderr, "narrow continuous op=%d opacity=%.17g mask=%d i=%d got=%u ref=%d\n", op, opacity, mask, i, unsigned(out[i]), expected);
+              std::abort();
+            }
+          }
+        }
+      }
+  }
+}
+
 int main() {
+  VerifyNarrowContinuous();
   VerifyQ15Differences();
   // All 256^3 base/source/mask combinations for both 8-bit operations.
   // Wider depths include maximum-product overflow boundaries and random masks.

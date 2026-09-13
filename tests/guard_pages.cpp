@@ -256,7 +256,12 @@ void large_masked_mix(const cp_kernels* k, int width) {
     }
     CHECK(cp_process_plane(&config, pa, pb, &pm, nullptr, nullptr, {reference.data(), width, 1}, rows) == CP_OK);
     CHECK(k->process_plane(&config, pa, pb, &pm, nullptr, nullptr, {destination, width, 1}, rows) == CP_OK);
-    CHECK(std::memcmp(destination, reference.data(), width) == 0);
+    for (int i = 0; i < width; ++i) {
+      // Continuous integer mixing permits one code, including the NEON
+      // byte-weight path. Aliasing and inaccessible guard pages stay covered.
+      const int tolerance = static_cast<unsigned char>(i * 73) == 0 ? 0 : 1;
+      CHECK(std::abs(int(destination[i]) - int(reference[i])) <= tolerance);
+    }
   }
 }
 
