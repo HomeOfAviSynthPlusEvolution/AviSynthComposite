@@ -957,17 +957,29 @@ void IntegerYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_y
   const cp_const_plane m[3]{mask ? mask->y : cp_const_plane{}, mask ? mask->u : cp_const_plane{},
                             mask ? mask->v : cp_const_plane{}};
   const cp_plane out[3]{output.y, output.u, output.v};
-  const size_t n = hn::Lanes(d);
-  for (int y = r.first; y < r.first + r.count; ++y)
-    for (size_t xx = 0; xx < size_t(r.width); xx += n) {
+  const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+  // YuvRows has established contiguous samples. Split only the bounded tail.
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
       const int x = static_cast<int>(xx);
-      const size_t count = std::min(n, size_t(r.width) - xx);
+      const auto load = [&](cp_const_plane p) HWY_ATTR {
+        if constexpr (decltype(direct)::value)
+          return hn::LoadU(dt, reinterpret_cast<const T*>(address(p, 0, y)) + xx);
+        else
+          return LoadChannel(dt, p, x, y, count);
+      };
+      const auto store = [&](auto value, cp_plane p) HWY_ATTR {
+        if constexpr (decltype(direct)::value)
+          hn::StoreU(value, dt, reinterpret_cast<T*>(address(p, 0, y)) + xx);
+        else
+          StoreChannel(value, dt, p, x, y, count);
+      };
       hn::VFromD<decltype(di)> v_0, v_1, v_2;
       for (int p = 0; p < 3; ++p) {
-        const auto av = hn::PromoteTo(di, LoadChannel(dt, a[p], x, y, count));
-        const auto bv = hn::PromoteTo(di, LoadChannel(dt, b[p], x, y, count));
+        const auto av = hn::PromoteTo(di, load(a[p]));
+        const auto bv = hn::PromoteTo(di, load(b[p]));
         const auto weight =
-            mask ? DivideCode(d, hn::Add(hn::Mul(hn::PromoteTo(d, LoadChannel(dt, m[p], x, y, count)), level), half),
+            mask ? DivideCode(d, hn::Add(hn::Mul(hn::PromoteTo(d, load(m[p])), level), half),
                               bits)
                  : level;
         const auto difference = hn::Sub(bv, p ? center : zero);
@@ -986,8 +998,12 @@ void IntegerYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_y
                     hn::Add(center, hn::ShiftRightSame(hn::Mul(hn::Sub(VectorChannel(v_0, v_1, v_2, p), center), keep),
                                                        bits - 3))));
       for (int p = 0; p < 3; ++p)
-        StoreChannel(hn::DemoteTo(dt, VectorChannel(v_0, v_1, v_2, p)), dt, out[p], x, y, count);
-    }
+        store(hn::DemoteTo(dt, VectorChannel(v_0, v_1, v_2, p)), out[p]);
+    };
+    size_t x = 0;
+    for (; x < end; x += n) block(std::true_type{}, x, n);
+    if (x < width) block(std::false_type{}, x, width - x);
+  }
 }
 
 // The artistic targets are integers before mixing. Splitting a delta larger
@@ -1012,20 +1028,32 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
   const cp_const_plane m[3]{mask ? mask->y : cp_const_plane{}, mask ? mask->u : cp_const_plane{},
                             mask ? mask->v : cp_const_plane{}};
   const cp_plane out[3]{output.y, output.u, output.v};
-  const size_t n = hn::Lanes(d);
-  for (int y = r.first; y < r.first + r.count; ++y)
-    for (size_t xx = 0; xx < size_t(r.width); xx += n) {
+  const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+  // YuvRows has established contiguous samples. Split only the bounded tail.
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
       const int x = static_cast<int>(xx);
-      const size_t count = std::min(n, size_t(r.width) - xx);
+      const auto load = [&](cp_const_plane p) HWY_ATTR {
+        if constexpr (decltype(direct)::value)
+          return hn::LoadU(dt, reinterpret_cast<const T*>(address(p, 0, y)) + xx);
+        else
+          return LoadChannel(dt, p, x, y, count);
+      };
+      const auto store = [&](auto value, cp_plane p) HWY_ATTR {
+        if constexpr (decltype(direct)::value)
+          hn::StoreU(value, dt, reinterpret_cast<T*>(address(p, 0, y)) + xx);
+        else
+          StoreChannel(value, dt, p, x, y, count);
+      };
       hn::VFromD<decltype(di)> v_0, v_1, v_2;
       auto guide = hn::Zero(d);
       if constexpr (operation == CP_YUV_EXCLUSION)
-        guide = hn::PromoteTo(d, LoadChannel(dt, b[0], x, y, count));
+        guide = hn::PromoteTo(d, load(b[0]));
       for (int p = 0; p < 3; ++p) {
-        const auto av = hn::PromoteTo(di, LoadChannel(dt, a[p], x, y, count));
-        const auto bv = hn::PromoteTo(di, LoadChannel(dt, b[p], x, y, count));
+        const auto av = hn::PromoteTo(di, load(a[p]));
+        const auto bv = hn::PromoteTo(di, load(b[p]));
         const auto weight =
-            mask ? DivideCode(d, hn::Add(hn::Mul(hn::PromoteTo(d, LoadChannel(dt, m[p], x, y, count)), level), half),
+            mask ? DivideCode(d, hn::Add(hn::Mul(hn::PromoteTo(d, load(m[p])), level), half),
                               bits)
                  : level;
         auto difference = hn::Sub(bv, center);
@@ -1059,8 +1087,12 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
                     hn::Add(center, hn::ShiftRightSame(hn::Mul(hn::Sub(VectorChannel(v_0, v_1, v_2, p), center), keep),
                                                        bits - 3))));
       for (int p = 0; p < 3; ++p)
-        StoreChannel(hn::DemoteTo(dt, VectorChannel(v_0, v_1, v_2, p)), dt, out[p], x, y, count);
-    }
+        store(hn::DemoteTo(dt, VectorChannel(v_0, v_1, v_2, p)), out[p]);
+    };
+    size_t x = 0;
+    for (; x < end; x += n) block(std::true_type{}, x, n);
+    if (x < width) block(std::false_type{}, x, width - x);
+  }
 }
 
 // Float YUV supports only Add/Subtract here. Resolve operation and masking
