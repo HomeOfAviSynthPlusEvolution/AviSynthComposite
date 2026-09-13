@@ -672,6 +672,30 @@ void FloatSteppedBox(const cp_kernels* k) {
         }
 }
 
+void FloatSimpleAffine(const cp_kernels* k) {
+  const float samples[] = {0.f, -0.f, 1.f, -1.f, 100.f, -100.f, 1.f / 65535,
+                           std::nextafter(.5f, 0.f), std::nextafter(.5f, 1.f), INFINITY, -INFINITY, NAN};
+  for (int source_step : {1, 4})
+    for (int output_step : {1, 4})
+      for (bool negative : {false, true}) {
+        Image<float> input(65, 4, source_step, negative), got(65, 4, output_step, !negative), ref = got;
+        for (int y = 0; y < input.h; ++y)
+          for (int x = 0; x < input.w; ++x)
+            input.data[input.origin + y * input.pitch + x * source_step] = samples[(x + y) % 12];
+        const cp_rows band{65, 4, 1, 2};
+        for (double a : {-1., -0., 0., 1.})
+          for (double b : {-1., -.5, -0., 0., .125, .1, 128.}) {
+            CHECK(k->affine(format(32), input.in(), got.out(), band, a, b) == CP_OK);
+            CHECK(cp_affine(format(32), input.in(), ref.out(), band, a, b) == CP_OK);
+            same(got, ref, "simple affine exact offsets and double offset fallback");
+            auto inplace = input, expected = input;
+            CHECK(k->affine(format(32), inplace.in(), inplace.out(), band, a, b) == CP_OK);
+            CHECK(cp_affine(format(32), expected.in(), expected.out(), band, a, b) == CP_OK);
+            same(inplace, expected, "simple affine in-place signed zero and exceptional inputs");
+          }
+      }
+}
+
 void FloatInversion(const cp_kernels* k) {
   const float samples[] = {0.f, -0.f, 1.f, std::nextafter(1.f, 0.f), std::nextafter(1.f, 2.f),
                            -1.f, 100.f, -100.f, 1.f / 65535, -1.f / 65535, INFINITY, -INFINITY, NAN};
@@ -861,6 +885,7 @@ int main() {
       IntegerKeyThresholds<uint16_t>(k, bits);
     FloatKeyThresholds(k);
     FloatInversion(k);
+    FloatSimpleAffine(k);
     FloatSteppedBox(k);
     FloatSteppedViews(k);
     FloatMultiplySpecials(k);
