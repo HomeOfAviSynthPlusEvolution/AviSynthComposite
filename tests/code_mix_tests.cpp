@@ -95,7 +95,35 @@ void Verify(int bits, int weights) {
     }
   }
 }
+void VerifyQ15Differences() {
+  // Every signed U8 difference at every Q15 weight. Integer translation of
+  // both inputs leaves rounding unchanged; 511 samples also exercise tails.
+  constexpr int n = 511;
+  std::vector<uint8_t> a(n), b(n), out(n), expected(n);
+  for (int i = 0; i < n; ++i) {
+    a[i] = uint8_t(std::max(255 - i, 0));
+    b[i] = uint8_t(std::max(i - 255, 0));
+  }
+  const cp_const_plane pa{a.data(), n, 1}, pb{b.data(), n, 1};
+  const cp_plane po{out.data(), n, 1};
+  std::vector<int64_t> targets{CP_TARGET_C};
+  for (auto remaining = cp_supported_targets(); remaining; remaining &= remaining - 1)
+    targets.push_back(remaining & -remaining);
+  for (int weight = 0; weight <= 32768; ++weight) {
+    const cp_plane_config c{{CP_U8, 8}, CP_MIX, weight / 32768.0, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+    for (int i = 0; i < n; ++i)
+      expected[i] = uint8_t((unsigned(a[i]) * (32768 - weight) + unsigned(b[i]) * weight + 16384) / 32768);
+    for (const auto target : targets)
+      if (cp_get_kernels(target)->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, po, {n, 1, 0, 1}) != CP_OK ||
+          out != expected) {
+        std::fprintf(stderr, "Q15 difference mismatch: weight=%d target=%lld\n", weight, (long long)target);
+        std::abort();
+      }
+  }
+}
+
 int main() {
+  VerifyQ15Differences();
   // All 256^3 base/source/mask combinations for both 8-bit operations.
   // Wider depths include maximum-product overflow boundaries and random masks.
   Verify<uint8_t>(8, 256);
