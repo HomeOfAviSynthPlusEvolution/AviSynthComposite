@@ -220,9 +220,73 @@ void MultiplyYuvU8Dyadic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
 // 16u*M = 8*epsilon*M. Tiny/subnormal weights obey the same absolute bound.
 // Recompute samples near a half-integer in the original order. This keeps
 // exact integer outputs while usually processing twice as many SIMD lanes.
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+// Quantize the combined darkening factor once, then share it across channels.
+// Float evaluation contributes < .063 code through 16 bits; weight rounding
+// adds <= .5 code to the final sample, hence total output error remains <=1 LSB.
+// Integer convex sums plus rounding and DivideCode's correction fit the lane.
+template <class T, bool masked>
+void MultiplyYuvNarrow(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source,
+                       const cp_const_yuv* masks, cp_yuv output, cp_rows r) {
+  using Acc = typename std::conditional<sizeof(T) == 1, uint16_t, uint32_t>::type;
+  const hn::ScalableTag<Acc> d;
+  const hn::Rebind<T, decltype(d)> dt;
+  const hn::ScalableTag<float> df;
+  const hn::Rebind<uint32_t, decltype(df)> du;
+  const unsigned maximum = (1u << c->format.bits) - 1;
+  const float scale = float(c->opacity / maximum);
+  const auto max = hn::Set(d, Acc(maximum));
+  const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+  const bool shared = !masked || (masks->y.data == masks->u.data && masks->y.data == masks->v.data &&
+                                  masks->y.stride == masks->u.stride && masks->y.stride == masks->v.stride);
+  const auto weight = [&](auto guide, auto mask) HWY_ATTR {
+    const auto product = hn::Mul(hn::Sub(max, guide), mask);
+    const auto convert = [&](auto v) HWY_ATTR {
+      const auto scaled = hn::Mul(hn::ConvertTo(df, v), hn::Set(df, scale));
+      return hn::ConvertTo(du, hn::Add(scaled, hn::Set(df, .5f)));
+    };
+    if constexpr (sizeof(T) == 1) {
+      const hn::Half<decltype(d)> dh;
+      return hn::Min(max, hn::Combine(d, hn::DemoteTo(dh, convert(hn::PromoteTo(du, hn::UpperHalf(dh, product)))),
+                                        hn::DemoteTo(dh, convert(hn::PromoteTo(du, hn::LowerHalf(dh, product))))));
+    } else {
+      return hn::Min(max, convert(product));
+    }
+  };
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto load = [&](cp_const_plane p, size_t x) HWY_ATTR {
+      return hn::PromoteTo(d, hn::LoadU(dt, reinterpret_cast<const T*>(address(p, 0, y)) + x));
+    };
+    for (size_t x = 0; x < end; x += n) {
+      const auto guide = load(source.y, x);
+      const auto ay = load(base.y, x), au = load(base.u, x), av = load(base.v, x);
+      const auto wy = weight(guide, masked ? load(masks->y, x) : max);
+      const auto wu = shared ? wy : weight(guide, load(masks->u, x));
+      const auto wv = shared ? wy : weight(guide, load(masks->v, x));
+      const auto finish = [&](auto a, auto w, bool chroma) HWY_ATTR {
+        auto sum = hn::Mul(a, hn::Sub(max, w));
+        if (chroma) sum = hn::Add(sum, hn::Mul(w, hn::Set(d, Acc((maximum + 1) / 2))));
+        return hn::DemoteTo(dt, DivideCode(d, hn::Add(sum, hn::Set(d, Acc(maximum / 2))), c->format.bits));
+      };
+      const auto yy = finish(ay, wy, false), uu = finish(au, wu, true), vv = finish(av, wv, true);
+      hn::StoreU(yy, dt, reinterpret_cast<T*>(address(output.y, 0, y)) + x);
+      hn::StoreU(uu, dt, reinterpret_cast<T*>(address(output.u, 0, y)) + x);
+      hn::StoreU(vv, dt, reinterpret_cast<T*>(address(output.v, 0, y)) + x);
+    }
+  }
+  MultiplyYuvTail(c, base, source, masks, output, r, end);
+}
+#endif
+
 template <class T, bool masked, bool approximate = false>
 void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv source,
                                const cp_const_yuv* masks, cp_yuv output, cp_rows r) {
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+  if constexpr (approximate && sizeof(T) == 1) {
+    MultiplyYuvNarrow<T, masked>(c, base, source, masks, output, r);
+    return;
+  }
+#endif
   const hn::ScalableTag<float> d;
   const hn::Rebind<T, decltype(d)> dt;
   const hn::Rebind<int32_t, decltype(d)> di;
