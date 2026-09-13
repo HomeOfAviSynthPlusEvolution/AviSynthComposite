@@ -1689,8 +1689,53 @@ void FloatLumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r) {
     }
 }
 
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+void IntegerLumaU8Rows(cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
+  const hn::ScalableTag<uint32_t> d;
+  const hn::ScalableTag<uint16_t> d16;
+  const hn::Half<decltype(d16)> dh16;
+  const hn::Rebind<uint8_t, decltype(d16)> d8;
+  const size_t n = hn::Lanes(d16), width = size_t(r.width), end = width - width % n;
+  const bool contiguous = rgb.r.step == 1 && rgb.g.step == 1 && rgb.b.step == 1 && out.step == 1;
+  const auto sum = [&](auto rv, auto gv, auto bv) HWY_ATTR {
+    auto v = hn::Add(hn::Mul(hn::PromoteTo(d, rv), hn::Set(d, 9798)),
+                     hn::Mul(hn::PromoteTo(d, gv), hn::Set(d, 19234)));
+    v = hn::Add(v, hn::Mul(hn::PromoteTo(d, bv), hn::Set(d, 3736)));
+    return hn::DemoteTo(dh16, hn::ShiftRight<15>(hn::Add(v, hn::Set(d, rounding == CP_LUMA_NEAREST ? 16384 : 0))));
+  };
+  const auto luma = [&](auto rr, auto gg, auto bb) HWY_ATTR {
+    const auto rv = hn::PromoteTo(d16, rr), gv = hn::PromoteTo(d16, gg), bv = hn::PromoteTo(d16, bb);
+    const auto low = sum(hn::LowerHalf(dh16, rv), hn::LowerHalf(dh16, gv), hn::LowerHalf(dh16, bv));
+    const auto high = sum(hn::UpperHalf(dh16, rv), hn::UpperHalf(dh16, gv), hn::UpperHalf(dh16, bv));
+    return hn::DemoteTo(d8, hn::Combine(d16, high, low));
+  };
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    size_t x = 0;
+    if (contiguous) {
+      const auto* rp = address(rgb.r, 0, y);
+      const auto* gp = address(rgb.g, 0, y);
+      const auto* bp = address(rgb.b, 0, y);
+      auto* dst = address(out, 0, y);
+      for (; x < end; x += n)
+        hn::StoreU(luma(hn::LoadU(d8, rp + x), hn::LoadU(d8, gp + x), hn::LoadU(d8, bp + x)), d8, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      StoreChannel(luma(LoadChannel(d8, rgb.r, int(x), y, count), LoadChannel(d8, rgb.g, int(x), y, count),
+                        LoadChannel(d8, rgb.b, int(x), y, count)), d8, out, int(x), y, count);
+    }
+  }
+}
+#endif
+
 template <class T>
 void IntegerLumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+  if constexpr (std::is_same<T, uint8_t>::value) {
+    IntegerLumaU8Rows(rgb, out, r, rounding);
+    return;
+  }
+#endif
   using AccTag = hn::ScalableTag<uint32_t>;
   const AccTag d;
   const hn::Rebind<T, AccTag> dt;
@@ -1721,28 +1766,6 @@ void IntegerLumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
       const auto* gp = reinterpret_cast<const T*>(address(rgb.g, 0, y));
       const auto* bp = reinterpret_cast<const T*>(address(rgb.b, 0, y));
       auto* dst = reinterpret_cast<T*>(address(out, 0, y));
-#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
-      if constexpr (std::is_same<T, uint8_t>::value) {
-        const hn::ScalableTag<uint16_t> d16;
-        const hn::Half<decltype(d16)> dh16;
-        const hn::Rebind<uint8_t, decltype(d16)> d8;
-        const size_t lanes = hn::Lanes(d16), wide_end = width - width % lanes;
-        const auto sum = [&](auto rv, auto gv, auto bv) HWY_ATTR {
-          auto v = hn::Add(hn::Mul(hn::PromoteTo(d, rv), hn::Set(d, 9798)),
-                           hn::Mul(hn::PromoteTo(d, gv), hn::Set(d, 19234)));
-          v = hn::Add(v, hn::Mul(hn::PromoteTo(d, bv), hn::Set(d, 3736)));
-          return hn::DemoteTo(dh16, hn::ShiftRight<15>(hn::Add(v, hn::Set(d, rounding == CP_LUMA_NEAREST ? 16384 : 0))));
-        };
-        for (; x < wide_end; x += lanes) {
-          const auto rv = hn::PromoteTo(d16, hn::LoadU(d8, rp + x));
-          const auto gv = hn::PromoteTo(d16, hn::LoadU(d8, gp + x));
-          const auto bv = hn::PromoteTo(d16, hn::LoadU(d8, bp + x));
-          const auto low = sum(hn::LowerHalf(dh16, rv), hn::LowerHalf(dh16, gv), hn::LowerHalf(dh16, bv));
-          const auto high = sum(hn::UpperHalf(dh16, rv), hn::UpperHalf(dh16, gv), hn::UpperHalf(dh16, bv));
-          hn::StoreU(hn::DemoteTo(d8, hn::Combine(d16, high, low)), d8, dst + x);
-        }
-      }
-#endif
       for (; x < end; x += n)
         hn::StoreU(luma(hn::LoadU(dt, rp + x), hn::LoadU(dt, gp + x), hn::LoadU(dt, bp + x)), dt, dst + x);
     }
