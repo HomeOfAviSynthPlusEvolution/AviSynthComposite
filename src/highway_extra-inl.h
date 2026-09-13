@@ -695,8 +695,10 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
   // by at most one code. Keep full-opacity exact kernels.
   if constexpr (!std::is_same<T, float>::value) {
     const double level = c->opacity * 256;
-    // The existing U8 unmasked dyadic kernel is faster than float SIMD.
-    const bool keep_byte_dyadic = sizeof(T) == 1 && !masked && level == std::floor(level);
+    // Reserve dyadic weights only when the exact integer kernel below can
+    // actually run. Other targets/small images use the same <=1 LSB path.
+    const bool keep_byte_dyadic = HWY_TARGET <= HWY_AVX2 && sizeof(T) == 1 && !masked &&
+                                  int64_t(r.width) * r.count >= 65536 && level == std::floor(level);
     if (c->opacity > 0 && c->opacity < 1 && !keep_byte_dyadic) {
       MultiplyYuvFloatCandidate<T, masked, true>(c, base, source, masks, output, r);
       return;
