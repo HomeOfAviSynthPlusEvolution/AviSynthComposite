@@ -229,6 +229,20 @@ HWY_NOINLINE int ProductContinuousRows(const cp_plane_config* c, cp_const_plane 
   return CP_OK;
 }
 
+// Vector-backed comparison masks contain only zero or all-one lanes. Truncating
+// their bits is exact and avoids the general saturating i64 demotion sequence.
+// Targets with compact mask registers retain Highway's native mask conversion.
+template <class DTo, class DFrom, class M>
+HWY_INLINE auto NarrowMask(DTo to, DFrom from, M mask) {
+#if HWY_TARGET == HWY_AVX2 || HWY_TARGET == HWY_SSE4 || HWY_TARGET == HWY_SSSE3 || HWY_TARGET == HWY_SSE2
+  const hn::RebindToUnsigned<DTo> du_to;
+  const hn::RebindToUnsigned<DFrom> du_from;
+  return hn::MaskFromVec(hn::BitCast(to, hn::TruncateTo(du_to, hn::BitCast(du_from, hn::VecFromMask(from, mask)))));
+#else
+  return hn::DemoteMaskTo(to, from, mask);
+#endif
+}
+
 // Bounded continuous guided blend; extrapolation retains the reference path.
 template <class T, bool masked>
 HWY_NOINLINE int GuidedContinuousRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
@@ -425,20 +439,6 @@ int CodePlaneRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, 
 }
 
 #if HWY_HAVE_FLOAT64
-// Vector-backed comparison masks contain only zero or all-one lanes. Truncating
-// their bits is exact and avoids the general saturating i64 demotion sequence.
-// Targets with compact mask registers retain Highway's native mask conversion.
-template <class DTo, class DFrom, class M>
-HWY_INLINE auto NarrowMask(DTo to, DFrom from, M mask) {
-#if HWY_TARGET == HWY_AVX2 || HWY_TARGET == HWY_SSE4 || HWY_TARGET == HWY_SSSE3 || HWY_TARGET == HWY_SSE2
-  const hn::RebindToUnsigned<DTo> du_to;
-  const hn::RebindToUnsigned<DFrom> du_from;
-  return hn::MaskFromVec(hn::BitCast(to, hn::TruncateTo(du_to, hn::BitCast(du_from, hn::VecFromMask(from, mask)))));
-#else
-  return hn::DemoteMaskTo(to, from, mask);
-#endif
-}
-
 template <class T, class D>
 hn::VFromD<D> LoadDouble(D d, cp_const_plane p, int x, int y, size_t count) {
   const hn::Rebind<T, D> dt;
