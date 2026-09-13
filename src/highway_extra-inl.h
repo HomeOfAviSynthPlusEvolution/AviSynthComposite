@@ -947,6 +947,8 @@ void IntegerYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_y
   const hn::ScalableTag<Acc> d;
   const hn::Rebind<Signed, decltype(d)> di;
   const hn::Rebind<T, decltype(d)> dt;
+  // Resolve the type before the lambda: MSVC can treat its captured tag as a reference.
+  using SignedVector = hn::VFromD<decltype(di)>;
   const int bits = c->format.bits;
   const uint32_t maximum = (1u << bits) - 1, center_code = 1u << (bits - 1), over_code = 1u << (bits - 3);
   const auto half = hn::Set(d, Acc(maximum / 2));
@@ -974,7 +976,7 @@ void IntegerYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_y
         else
           StoreChannel(value, dt, p, x, y, count);
       };
-      hn::VFromD<decltype(di)> v_0, v_1, v_2;
+      SignedVector v_0, v_1, v_2;
       for (int p = 0; p < 3; ++p) {
         const auto av = hn::PromoteTo(di, load(a[p]));
         const auto bv = hn::PromoteTo(di, load(b[p]));
@@ -1018,6 +1020,8 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
   const hn::ScalableTag<Acc> d;
   const hn::Rebind<Signed, decltype(d)> di;
   const hn::Rebind<T, decltype(d)> dt;
+  // Resolve the type before the lambda: MSVC can treat its captured tag as a reference.
+  using SignedVector = hn::VFromD<decltype(di)>;
   const int bits = c->format.bits;
   const uint32_t maximum = (1u << bits) - 1, center_code = 1u << (bits - 1), over_code = 1u << (bits - 3);
   const auto half = hn::Set(d, Acc(maximum / 2)), maxu = hn::Set(d, Acc(maximum));
@@ -1045,7 +1049,7 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
         else
           StoreChannel(value, dt, p, x, y, count);
       };
-      hn::VFromD<decltype(di)> v_0, v_1, v_2;
+      SignedVector v_0, v_1, v_2;
       auto guide = hn::Zero(d);
       if constexpr (operation == CP_YUV_EXCLUSION)
         guide = hn::PromoteTo(d, load(b[0]));

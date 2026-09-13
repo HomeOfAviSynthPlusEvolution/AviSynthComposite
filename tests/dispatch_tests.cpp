@@ -226,6 +226,9 @@ static void FloatBlendSpecials(const cp_kernels* table) {
               CHECK(std::abs(double(actual[i])-expected[i]) <= 16*std::numeric_limits<float>::epsilon()*std::max(1.0,scale));
               continue;
             }
+            if (std::memcmp(actual + i, expected + i, 4) != 0)
+              std::fprintf(stderr, "FloatBlendSpecials op=%d neutral=%g opacity=%g mask=%d i=%d a=%a b=%a m=%a got=%a ref=%a\n",
+                           op, neutral, opacity, int(masked), i, double(a[i]), double(b[i]), double(m[i]), double(actual[i]), double(expected[i]));
             CHECK(std::memcmp(actual + i, expected + i, 4) == 0);
           }
         }

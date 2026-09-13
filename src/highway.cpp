@@ -622,8 +622,15 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
       target = hn::Add(av, bv);
     else if constexpr (operation == CP_DIFFERENCE)
       target = hn::Add(hn::Sub(av, bv), hn::Set(d, bias_value));
-    else if constexpr (operation == CP_GUIDED_MULTIPLY)
+    else if constexpr (operation == CP_GUIDED_MULTIPLY) {
       target = hn::Add(neutral, hn::Mul(hn::Sub(av, neutral), bv));
+#if defined(_MSC_VER) && !defined(__clang__)
+      // MSVC can fold away the +0 neutral even under /fp:strict. The scalar
+      // expression adds +0, so an exact zero target must have a positive sign.
+      if constexpr (center_mode == 1)
+        target = hn::IfThenElse(hn::Eq(target, zero), zero, target);
+#endif
+    }
     // Unmasked MIX copy endpoints were already handled by Plane.
     if constexpr ((operation == CP_PRODUCT || operation == CP_GUIDED_MULTIPLY) && !masked) {
       // Plane handles zero opacity and dispatches the full-product endpoint.
@@ -1099,7 +1106,7 @@ void CompatRows(cp_format f, cp_const_plane a, cp_const_plane b, const cp_const_
   const auto blend = [&](auto ac, auto bc, auto mc) HWY_ATTR {
     const auto av = hn::PromoteTo(d, ac), bv = hn::PromoteTo(d, bc);
     auto result = hn::Zero(d);
-    if constexpr (!masked) {
+    if constexpr (mask_mode == 0) {
       result = hn::ShiftRight<8>(
           hn::Add(hn::Add(hn::Mul(av, hn::Set(d, static_cast<Acc>(256 - opacity))), hn::Mul(bv, vo)), hn::Set(d, 128)));
     } else {
