@@ -1132,6 +1132,11 @@ int Copy(cp_format f, cp_const_plane source, cp_plane output, cp_rows r) {
   if (source.data == output.data && source.stride == output.stride && source.step == output.step)
     return CP_OK;
   if (source.step == bytes && output.step == bytes) {
+    const size_t row_bytes = size_t(r.width) * bytes;
+    if (source.stride == ptrdiff_t(row_bytes) && output.stride == ptrdiff_t(row_bytes)) {
+      std::memcpy(address(output, 0, r.first), address(source, 0, r.first), row_bytes * size_t(r.count));
+      return CP_OK;
+    }
     for (int y = r.first; y < r.first + r.count; ++y)
       std::memcpy(address(output, 0, y), address(source, 0, y), size_t(r.width) * bytes);
     return CP_OK;

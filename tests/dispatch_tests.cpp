@@ -525,6 +525,27 @@ static void FiniteFloatBlends(const cp_kernels* k) {
   std::printf("bounded float blends normalized max error %.9g\n", max_normal_error);
 }
 
+void CheckDenseCopy(const cp_kernels* table) {
+  for (int bytes : {1, 2, 4})
+    for (int padding : {0, 7})
+      for (bool negative : {false, true}) {
+        constexpr int width = 65, height = 5;
+        const int stride = (width + padding) * bytes;
+        std::vector<uint32_t> source((stride * height + 3) / 4), dest(source.size()), expected(source.size());
+        auto* src = reinterpret_cast<uint8_t*>(source.data());
+        auto* dst = reinterpret_cast<uint8_t*>(dest.data());
+        auto* ref = reinterpret_cast<uint8_t*>(expected.data());
+        for (int i = 0; i < stride * height; ++i) src[i] = uint8_t(i * 17);
+        const int origin = negative ? stride * (height - 1) : 0;
+        const ptrdiff_t pitch = negative ? -stride : stride;
+        for (int y = 1; y < 4; ++y)
+          std::memcpy(ref + origin + y * pitch, src + origin + y * pitch, width * bytes);
+        const cp_format f{bytes == 1 ? CP_U8 : bytes == 2 ? CP_U16 : CP_F32, bytes * 8};
+        CHECK(table->copy(f, {src + origin, pitch, bytes}, {dst + origin, pitch, bytes}, {width, height, 1, 3}) == CP_OK);
+        CHECK(dest == expected);
+      }
+}
+
 int main() {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -541,6 +562,7 @@ int main() {
   for (int64_t remaining = supported; remaining; remaining &= remaining - 1)
     targets.push_back(remaining & -remaining);
   for (const int64_t target : targets) {
+    CheckDenseCopy(cp_get_kernels(target));
     const auto* table = cp_get_kernels(target);
     CHECK(table);
     CHECK(table == cp_get_kernels(target));
