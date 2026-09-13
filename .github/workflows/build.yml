@@ -11,14 +11,14 @@ jobs:
         scalar: ["ON", "OFF"]
     runs-on: ${{ matrix.os }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cmake -S . -B build/ci -DCP_BUILD_TESTS=ON -DCP_SCALAR_ONLY=${{ matrix.scalar }} -DCMAKE_BUILD_TYPE=Release
       - run: cmake --build build/ci --config Release --parallel
       - run: ctest --test-dir build/ci -C Release --output-on-failure
   sanitizer:
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: >-
           cmake -S . -B build/sanitize
           -DCMAKE_C_COMPILER=clang -DCMAKE_CXX_COMPILER=clang++
@@ -33,7 +33,7 @@ jobs:
       matrix:
         scalar: ["ON", "OFF"]
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - run: cmake -S . -B build/x86 -A Win32 -DCP_SCALAR_ONLY=${{ matrix.scalar }}
       - run: cmake --build build/x86 --config Release --parallel
       - run: ctest --test-dir build/x86 -C Release --output-on-failure
