@@ -1448,6 +1448,40 @@ void ScatterFloat(hn::VFromD<D> value, D d, float* p, hn::VFromD<hn::Rebind<int3
 }
 
 #if HWY_HAVE_FLOAT64
+// Multiplication by 0 or +/-1 is exact, so representable offsets permit
+// binary32 arithmetic without introducing an intermediate rounding error.
+// Keep the multiply/add (rather than copy/fill) for signed zero and Inf/NaN.
+HWY_NOINLINE void FloatSimpleAffineRows(cp_const_plane source, cp_plane out, cp_rows r, float first, float second) {
+  // Use at most eight floats even on wider targets: wider arithmetic alone
+  // does not improve large-plane throughput. Do not specialize by image size.
+  const hn::CappedTag<float, 8> d;
+  const size_t n = hn::Lanes(d), width = size_t(r.width), end = width - width % n;
+  const auto a = hn::Set(d, first), b = hn::Set(d, second);
+  const bool contiguous = source.step == sizeof(float) && out.step == sizeof(float);
+  const ptrdiff_t input_step = source.step, output_step = out.step;
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    const auto* src = address(source, 0, y);
+    auto* dst = address(out, 0, y);
+    size_t x = 0;
+    if (contiguous) {
+      const auto* input = reinterpret_cast<const float*>(src);
+      auto* output = reinterpret_cast<float*>(dst);
+      for (; x < end; x += n)
+        hn::StoreU(hn::Add(hn::Mul(hn::LoadU(d, input + x), a), b), d, output + x);
+      // Keep sparse-tail induction variables out of the contiguous SIMD loop.
+      for (; x < width; ++x)
+        output[x] = input[x] * first + second;
+      continue;
+    }
+    for (; x < width; ++x) {
+      float value;
+      std::memcpy(&value, src + ptrdiff_t(x) * input_step, sizeof(value));
+      value = value * first + second;
+      std::memcpy(dst + ptrdiff_t(x) * output_step, &value, sizeof(value));
+    }
+  }
+}
+
 template <class T, bool Clamp>
 void UnaryRows(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, double first, double second) {
   if constexpr (!Clamp && std::is_same<T, float>::value) {
@@ -1473,6 +1507,11 @@ void UnaryRows(cp_format f, cp_const_plane source, cp_plane out, cp_rows r, doub
           std::memcpy(address(out, static_cast<int>(x), y), &value, sizeof(value));
         }
       }
+      return;
+    }
+    if ((first == 0 || first == 1 || first == -1) && std::abs(second) <= std::numeric_limits<float>::max() &&
+        double(static_cast<float>(second)) == second) {
+      FloatSimpleAffineRows(source, out, r, static_cast<float>(first), static_cast<float>(second));
       return;
     }
     // Keep binary64 arithmetic, but separate complete contiguous vectors from
