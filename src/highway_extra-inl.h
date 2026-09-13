@@ -287,6 +287,12 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
     return;
   }
 #endif
+  const auto madd = [](auto a, auto b, auto c) HWY_ATTR {
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+    if constexpr (approximate && !masked) return hn::MulAdd(a, b, c);
+#endif
+    return hn::Add(hn::Mul(a, b), c);
+  };
   const hn::ScalableTag<float> d;
   const hn::Rebind<T, decltype(d)> dt;
   const hn::Rebind<int32_t, decltype(d)> di;
@@ -319,7 +325,7 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
           masked ? hn::Mul(opacity,
                            hn::Mul(hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, mask_rows[0] + x))), reciprocal))
                  : opacity;
-      const auto common_factor = hn::Add(one, hn::Mul(slope, common_weight));
+      const auto common_factor = madd(slope, common_weight, one);
       if constexpr (approximate) {
         // Keep approximate loops free of channel selection and
         // rounding-boundary work. Load all channels before any aliased store.
@@ -330,16 +336,16 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
           if constexpr (masked) {
             if (!shared) {
               const auto mv = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, mask_rows[p] + x)));
-              return hn::Add(one, hn::Mul(slope, hn::Mul(opacity, hn::Mul(mv, reciprocal))));
+              return madd(slope, hn::Mul(opacity, hn::Mul(mv, reciprocal)), one);
             }
           }
           return common_factor;
         };
         const auto uf = factor_for(1), vf = factor_for(2);
         const auto chroma_round = hn::Add(center, half);
-        const auto yy = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(ay, common_factor), half));
-        const auto uu = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(au, center), uf), chroma_round));
-        const auto vv = hn::ConvertInRangeTo(di, hn::Add(hn::Mul(hn::Sub(av, center), vf), chroma_round));
+        const auto yy = hn::ConvertInRangeTo(di, madd(ay, common_factor, half));
+        const auto uu = hn::ConvertInRangeTo(di, madd(hn::Sub(au, center), uf, chroma_round));
+        const auto vv = hn::ConvertInRangeTo(di, madd(hn::Sub(av, center), vf, chroma_round));
         hn::StoreU(hn::DemoteTo(dt, yy), dt, dest[0] + x);
         hn::StoreU(hn::DemoteTo(dt, uu), dt, dest[1] + x);
         hn::StoreU(hn::DemoteTo(dt, vv), dt, dest[2] + x);
