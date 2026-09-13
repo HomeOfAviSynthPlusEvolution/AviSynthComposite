@@ -1699,7 +1699,7 @@ void IntegerLumaRows(cp_const_rgb rgb, cp_plane out, cp_rows r, int rounding) {
       rgb.r.step == sizeof(T) && rgb.g.step == sizeof(T) && rgb.b.step == sizeof(T) && out.step == sizeof(T);
   const auto luma = [&](auto rr, auto gg, auto bb) HWY_ATTR {
     hn::VFromD<AccTag> rg;
-    if constexpr (std::is_same<T, uint8_t>::value) {
+    if constexpr (std::is_same<T, uint8_t>::value && !HWY_ARCH_ARM) {
       // U8 samples fit signed 16-bit lanes. One pairwise multiply-add
       // replaces two 32-bit products without changing the integer sum.
       const hn::Repartition<int16_t, AccTag> ds;
