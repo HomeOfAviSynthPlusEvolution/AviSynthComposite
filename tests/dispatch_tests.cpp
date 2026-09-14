@@ -2,6 +2,10 @@
 #include <composite/composite.h>
 #include <algorithm>
 #include <cmath>
+#include <cfenv>
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+#include <xmmintrin.h>
+#endif
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -104,7 +108,7 @@ static void Exhaustive(const cp_kernels* table) {
     }
 }
 template <class T>
-static void Arithmetic(const cp_kernels* table, int bits, int width, int step, bool negative) {
+static void Arithmetic(const cp_kernels* table, int bits, int width, int step, bool negative, int only_operation = -1) {
   const int stride = width * step + 7, height = 4, origin = negative ? 1 + stride * (height - 1) : 1;
   const size_t size = static_cast<size_t>(stride) * height;
   const double max = bits == 32 ? 1.0 : (1u << bits) - 1;
@@ -132,13 +136,16 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
       for (double opacity : {0.0, 0.17, 0.5, 1.0})
         for (int inclusive : {0, 1})
           for (bool masked : {false, true}) {
+            if (only_operation >= 0 && op != only_operation) continue;
             cp_plane_config c = {f,   op,        opacity, bits == 32 ? 0.0 : double(1 << (bits - 1)), max, max / 2,
                                  0.0, inclusive, rule};
             if (inclusive)
               c.threshold = bits == 32 ? double(std::numeric_limits<float>::epsilon() / 2) : 7;
             CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pd, rows) == CP_OK);
             CHECK(cp_process_plane(&c, pa, pb, masked ? &pm : nullptr, &pag, &pbg, pe, rows) == CP_OK);
-            if (bits != 32 && (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT || op == CP_ADD || op == CP_SUBTRACT || (op == CP_GUIDED_MULTIPLY && opacity < 1)) &&
+            if (bits != 32 &&
+                (op == CP_MIX || op == CP_INVERT_MIX || op == CP_PRODUCT || op == CP_ADD || op == CP_SUBTRACT ||
+                 (op == CP_GUIDED_MULTIPLY && opacity < 1)) &&
                 rule == CP_WEIGHT_CONTINUOUS && opacity != 0) {
               for (int y = rows.first; y < rows.first + rows.count; ++y)
                 for (int x = 0; x < width; ++x) {
@@ -170,6 +177,19 @@ static void Arithmetic(const cp_kernels* table, int bits, int width, int step, b
                                bits, width, op, rule, opacity, masked, i, double(actual[i]), double(expected[i]));
               CHECK(false);
             }
+            if (bits == 32 && op == CP_MIX && !masked) {
+              for (bool alias_a : {false, true}) {
+                const auto& input = alias_a ? a : b;
+                std::copy(input.begin(), input.end(), actual.begin());
+                std::copy(input.begin(), input.end(), expected.begin());
+                const cp_const_plane da{pd.data, pitch, spacing}, ea{pe.data, pitch, spacing};
+                CHECK(table->process_plane(&c, alias_a ? da : pa, alias_a ? pb : da, nullptr, nullptr, nullptr, pd,
+                                           rows) == CP_OK);
+                CHECK(cp_process_plane(&c, alias_a ? ea : pa, alias_a ? pb : ea, nullptr, nullptr, nullptr, pe, rows) ==
+                      CP_OK);
+                CHECK(std::memcmp(actual.data(), expected.data(), size * sizeof(T)) == 0);
+              }
+            }
           }
   CHECK(table->process_plane(nullptr, pa, pb, nullptr, nullptr, nullptr, pd, rows) == CP_INVALID_ARGUMENT);
 }
@@ -192,7 +212,7 @@ static void FloatEndpoints(const cp_kernels* table) {
     CHECK(std::memcmp(actual, expected, sizeof(actual)) == 0);
   }
 }
-static void FloatBlendSpecials(const cp_kernels* table) {
+static void FloatBlendSpecials(const cp_kernels* table, int only_operation = -1) {
   // Finite samples: signed zero, one 16-bit-scale step, ordinary colors and HDR100.
   // NaN/Inf are separate propagation cases, not brightness requirements.
   constexpr int n = 67;
@@ -209,6 +229,7 @@ static void FloatBlendSpecials(const cp_kernels* table) {
     for (double neutral : {-0.0, 0.0, .1, .5, -1.0})
       for (double opacity : {0.0, .17, .625, 1.0})
         for (bool masked : {false, true}) {
+          if (only_operation >= 0 && op != only_operation) continue;
           const cp_plane_config c{{CP_F32, 32}, op, opacity, neutral, neutral, neutral, 0, 0, CP_WEIGHT_CONTINUOUS};
           CHECK(table->process_plane(&c, pa, pb, masked ? &pm : nullptr, nullptr, &pb, {actual, n * 4, 4},
                                      {n, 1, 0, 1}) == CP_OK);
@@ -579,6 +600,84 @@ void U8AverageBounds(const cp_kernels* table) {
       }
 }
 
+// Exercise complete vectors and the scalar-width tail with independent binary64
+// half-weight expectations. Broadcast pairs force the fast guard and each fallback.
+static void FloatMixPrecision(const cp_kernels* table) {
+  constexpr int n = 4097;
+  std::vector<float> a(n), b(n), actual(n + 1), expected(n + 1);
+  cp_plane_config c{{CP_F32, 32}, CP_MIX, .5, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+  const cp_const_plane pa{a.data(), n * 4, 4}, pb{b.data(), n * 4, 4};
+  const auto check = [&] {
+    actual[n] = expected[n] = 123.f;
+    CHECK(cp_process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {expected.data(), n * 4, 4}, {n, 1, 0, 1}) == CP_OK);
+    CHECK(table->process_plane(&c, pa, pb, nullptr, nullptr, nullptr, {actual.data(), n * 4, 4}, {n, 1, 0, 1}) ==
+          CP_OK);
+    for (int i = 0; i <= n; ++i) {
+      if (std::isnan(actual[i]) && std::isnan(expected[i]))
+        continue;
+      CHECK(std::memcmp(&actual[i], &expected[i], sizeof(float)) == 0);
+    }
+    for (bool alias_a : {false, true}) {
+      std::copy(alias_a ? a.begin() : b.begin(), alias_a ? a.end() : b.end(), actual.begin());
+      const cp_const_plane alias{actual.data(), n * 4, 4};
+      CHECK(table->process_plane(&c, alias_a ? alias : pa, alias_a ? pb : alias, nullptr, nullptr, nullptr,
+                                 {actual.data(), n * 4, 4}, {n, 1, 0, 1}) == CP_OK);
+      for (int i = 0; i <= n; ++i) {
+        if (std::isnan(actual[i]) && std::isnan(expected[i]))
+          continue;
+        CHECK(std::memcmp(&actual[i], &expected[i], sizeof(float)) == 0);
+      }
+    }
+  };
+  const uint32_t patterns[] = {0,          0x80000000, 1,          0x007fffff, 0x00800000, 0x01000000, 0x3f800000,
+                               0x3f800001, 0x7effffff, 0x7f000000, 0x7f7fffff, 0xff7fffff, 0x7f800000, 0x7fc12345};
+  for (uint32_t av : patterns)
+    for (uint32_t bv : patterns) {
+      float af, bf;
+      std::memcpy(&af, &av, 4);
+      std::memcpy(&bf, &bv, 4);
+      std::fill(a.begin(), a.end(), af);
+      std::fill(b.begin(), b.end(), bf);
+      check();
+    }
+  const int previous_round = std::fegetround();
+  for (int mode : {FE_DOWNWARD, FE_UPWARD, FE_TOWARDZERO}) {
+    CHECK(std::fesetround(mode) == 0);
+    std::fill(a.begin(), a.end(), mode == FE_UPWARD ? -0x1p-100f : 0x1p-100f);
+    std::fill(b.begin(), b.end(), 1.f);
+    check();
+  }
+  CHECK(std::fesetround(previous_round) == 0);
+#if defined(_M_X64) || defined(__x86_64__) || defined(_M_IX86) || defined(__i386__)
+  const unsigned previous_csr = _mm_getcsr();
+  for (unsigned mode : {_MM_ROUND_DOWN, _MM_ROUND_UP, _MM_ROUND_TOWARD_ZERO}) {
+    _mm_setcsr((previous_csr & ~_MM_ROUND_MASK) | mode);
+    std::fill(a.begin(), a.end(), mode == _MM_ROUND_UP ? -0x1p-100f : 0x1p-100f);
+    std::fill(b.begin(), b.end(), 1.f);
+    check();
+  }
+  for (unsigned flush : {0u, 0x40u, 0x8000u, 0x8040u}) {
+    _mm_setcsr((previous_csr & ~0x8040u) | flush);
+    std::fill(a.begin(), a.end(), 0x0.fffffep-126f);
+    std::fill(b.begin(), b.end(), 0x1p-124f);
+    check();
+    std::fill(a.begin(), a.end(), std::numeric_limits<float>::denorm_min());
+    std::fill(b.begin(), b.end(), 1.f);
+    check();
+  }
+  _mm_setcsr(previous_csr);
+#endif
+  std::mt19937 random(0x754fea13);
+  for (int round = 0; round < 16; ++round) {
+    for (int i = 0; i < n; ++i) {
+      const uint32_t av = random(), bv = random();
+      std::memcpy(&a[i], &av, 4);
+      std::memcpy(&b[i], &bv, 4);
+    }
+    check();
+  }
+}
+
 int main(int argc, char** argv) {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
@@ -594,6 +693,20 @@ int main(int argc, char** argv) {
   std::vector<int64_t> targets = {CP_TARGET_C};
   for (int64_t remaining = supported; remaining; remaining &= remaining - 1)
     targets.push_back(remaining & -remaining);
+  if (argc > 1 && std::strcmp(argv[1], "f32-mix") == 0) {
+    for (const int64_t target : targets) {
+      const auto* table = cp_get_kernels(target);
+      FloatMixPrecision(table);
+      FloatBlendZeroSigns(table);
+      FloatBlendSpecials(table, CP_MIX);
+      for (int width : {1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257})
+        for (int step : {1, 4})
+          for (bool negative : {false, true})
+            Arithmetic<float>(table, 32, width, step, negative, CP_MIX);
+    }
+    std::puts("F32 mix tests passed");
+    return 0;
+  }
   if (argc > 1 && std::strcmp(argv[1], "u16-mix") == 0) {
     for (const int64_t target : targets)
       for (int bits = 9; bits <= 16; ++bits) {
@@ -656,6 +769,7 @@ int main(int argc, char** argv) {
     ContinuousIntegerRounding<uint8_t>(table, 8);
     for (int bits = 9; bits <= 16; ++bits)
       ContinuousIntegerRounding<uint16_t>(table, bits);
+    FloatMixPrecision(table);
     FloatBlendZeroSigns(table);
     FiniteFloatBlends(table);
     FloatEndpoints(table);

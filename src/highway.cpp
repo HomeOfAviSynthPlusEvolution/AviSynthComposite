@@ -3,6 +3,7 @@
 // Explicit target table pattern follows AviSynthConvertAudio/ConvertVideo.
 #include "common.h"
 #include <type_traits>
+#include <cfenv>
 
 #ifndef CP_SCALAR_ONLY
 #include <hwy/targets.h>
@@ -714,16 +715,79 @@ int IntegerBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane 
   return CP_OK;
 }
 
+// Exact in-place half-weight MIX. Layout dispatch happens before the loop.
+HWY_NOINLINE int FloatAverageInPlace(float* dst, const float* src, ptrdiff_t dst_stride, ptrdiff_t src_stride,
+                                     int width, int count) {
+  const hn::ScalableTag<double> d;
+  const hn::Rebind<float, decltype(d)> df;
+  const hn::ScalableTag<float> full;
+  const hn::RebindToUnsigned<decltype(full)> du;
+  const size_t n = hn::Lanes(full), w = size_t(width);
+#if HWY_ARCH_X86
+  // SIMD rounding follows MXCSR even when it differs from the x87 mode.
+  const bool nearest = (_mm_getcsr() & _MM_ROUND_MASK) == _MM_ROUND_NEAREST;
+#else
+  const bool nearest = std::fegetround() == FE_TONEAREST;
+#endif
+  const auto blend = [&](auto af, auto bf) HWY_ATTR {
+    const auto a = hn::PromoteTo(d, af), b = hn::PromoteTo(d, bf);
+    return hn::DemoteTo(df, hn::Add(a, hn::Mul(hn::Sub(b, a), hn::Set(d, .5))));
+  };
+  for (int y = 0; y < count; ++y) {
+    size_t x = 0;
+    for (; x + n <= w; x += n) {
+      const auto a = hn::LoadU(full, dst + x), b = hn::LoadU(full, src + x);
+      const auto mask = hn::Set(du, 0x7fffffffu);
+      const auto aa = hn::And(hn::BitCast(du, a), mask), ba = hn::And(hn::BitCast(du, b), mask);
+      // Check before adding; a discarded overflowing sum still raises an
+      // exception. Limit both inputs to FLT_MAX/2 and exclude nonfinite values.
+      const auto limit = hn::Set(du, 0x7effffffu);
+      if (nearest && hn::AllTrue(du, hn::And(hn::Le(aa, limit), hn::Le(ba, limit)))) {
+        const auto sum = hn::Add(a, b);
+        if (hn::AllTrue(du, hn::Gt(hn::And(hn::BitCast(du, sum), mask), hn::Set(du, 0x01000000u)))) {
+          // With normal sum and half-result, the power-of-two scaling is
+          // exact, and RNE gives the same float as the double average.
+          hn::StoreU(hn::Mul(sum, hn::Set(full, .5f)), full, dst + x);
+          continue;
+        }
+      }
+      const auto lo = blend(hn::LowerHalf(df, a), hn::LowerHalf(df, b));
+      const auto hi = blend(hn::UpperHalf(df, a), hn::UpperHalf(df, b));
+      hn::StoreU(hn::Combine(full, hi, lo), full, dst + x);
+    }
+    for (; x < w; ++x) {
+      const double a = dst[x], b = src[x];
+      dst[x] = float(a + (b - a) * .5);
+    }
+    if (y + 1 < count) {
+      dst += dst_stride;
+      src += src_stride;
+    }
+  }
+  return CP_OK;
+}
+
 // Common float blends retain reference double arithmetic outside the documented
 // finite-input fast paths. Layout and
 // operation dispatch happen before the row loop, not once per vector.
 template <int operation, bool masked, bool full_product = false, int center_mode = 0>
 int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b, const cp_const_plane* mask,
                    cp_plane output, cp_rows r) {
+  if constexpr (operation == CP_MIX && !masked) {
+    if (c->opacity == .5 && a.data == output.data && a.stride == output.stride && a.step == 4 && b.step == 4 &&
+        output.step == 4)
+      return FloatAverageInPlace(reinterpret_cast<float*>(address(output, 0, r.first)),
+                                 reinterpret_cast<const float*>(address(b, 0, r.first)), output.stride / 4,
+                                 b.stride / 4, r.width, r.count);
+  }
   const hn::ScalableTag<double> d;
   const hn::Rebind<float, decltype(d)> df;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
-  const double opacity_value = c->opacity, neutral_value = center_mode == 1 ? 0.0 : center_mode == 2 ? .5 : c->neutral, bias_value = c->bias, inversion_value = c->inversion_sum;
+  const double opacity_value = c->opacity,
+               neutral_value = center_mode == 1   ? 0.0
+                               : center_mode == 2 ? .5
+                                                  : c->neutral,
+               bias_value = c->bias, inversion_value = c->inversion_sum;
   const auto blend = [&](auto af, auto bf, auto mf) HWY_ATTR {
     const auto zero = hn::Zero(d), one = hn::Set(d, 1), opacity = hn::Set(d, opacity_value);
     const auto neutral = hn::Set(d, neutral_value);
@@ -778,8 +842,8 @@ int FloatBlendRows(const cp_plane_config* c, cp_const_plane a, cp_const_plane b,
         const auto onef = hn::Set(fast, 1.f), zerof = hn::Zero(fast);
         const auto of = hn::Set(fast, float(opacity_value));
         const auto io = hn::Set(fast, float(1.0 - opacity_value));
-        const auto safe = hn::Set(fast, std::numeric_limits<float>::max() *
-                                       (1.f - 64 * std::numeric_limits<float>::epsilon()));
+        const auto safe =
+            hn::Set(fast, std::numeric_limits<float>::max() * (1.f - 64 * std::numeric_limits<float>::epsilon()));
         for (; x + fn <= width; x += fn) {
           const auto af = hn::LoadU(fast, ap + x), bf = hn::LoadU(fast, bp + x);
           const auto mf = hn::LoadU(fast, mp + x);
