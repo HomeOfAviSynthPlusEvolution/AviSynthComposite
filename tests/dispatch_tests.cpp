@@ -594,6 +594,19 @@ int main(int argc, char** argv) {
   std::vector<int64_t> targets = {CP_TARGET_C};
   for (int64_t remaining = supported; remaining; remaining &= remaining - 1)
     targets.push_back(remaining & -remaining);
+  if (argc > 1 && std::strcmp(argv[1], "u16-mix") == 0) {
+    for (const int64_t target : targets)
+      for (int bits = 9; bits <= 16; ++bits) {
+        const auto* table = cp_get_kernels(target);
+        QuantizedMix<uint16_t>(table, bits);
+        for (int width : {1, 7, 15, 16, 17, 31, 32, 33, 63, 64, 65, 257})
+          for (int step : {1, 4})
+            for (bool negative : {false, true})
+              CheckLayout<uint16_t>(table, bits, width, step, negative);
+      }
+    std::puts("U16 mix tests passed");
+    return 0;
+  }
   if (argc > 1 && std::strcmp(argv[1], "u8-average") == 0) {
     for (const int64_t target : targets)
       U8AverageBounds(cp_get_kernels(target));

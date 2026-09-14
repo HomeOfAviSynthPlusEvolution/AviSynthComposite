@@ -188,23 +188,29 @@ int MixU8Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
 #if HWY_ARCH_X86
 int MixU16Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
                   uint32_t maximum_code) {
-  if (weight > 16384) {
-    std::swap(a, b);
-    weight = 32768 - weight;
-  }
   const hn::ScalableTag<uint16_t> d;
+  const hn::Rebind<int16_t, decltype(d)> di16;
+  const hn::Repartition<int32_t, decltype(d)> di32;
+  const hn::RebindToUnsigned<decltype(di32)> du32;
   const size_t n = hn::Lanes(d), width = size_t(r.width);
+  const auto pivot = hn::Set(d, uint16_t(32768));
+  const auto weights = hn::BitCast(di16, hn::Set(du32, ((weight << 16) | (32768 - weight))));
   const auto blend = [&](auto av, auto bv) HWY_ATTR {
-    const auto up = hn::Ge(bv, av);
-    const auto diff = hn::Sub(hn::Max(av, bv), hn::Min(av, bv));
-    const auto w = hn::Set(d, uint16_t(weight));
-    const auto low = hn::Mul(diff, w), high = hn::MulHigh(diff, w);
-    // Negative differences round ties toward +infinity, hence 16383.
-    const auto rounded = hn::Add(low, hn::IfThenElse(up, hn::Set(d, uint16_t(16384)), hn::Set(d, uint16_t(16383))));
-    // A carry across bit 16 contributes two after division by 2^15.
-    const auto carry = hn::IfThenElse(hn::Lt(rounded, low), hn::Set(d, uint16_t(2)), hn::Zero(d));
-    const auto delta = hn::Add(hn::Add(hn::ShiftLeft<1>(high), carry), hn::ShiftRight<15>(rounded));
-    const auto value = hn::IfThenElse(up, hn::Add(av, delta), hn::Sub(av, delta));
+    // Quantized endpoints cannot be represented as positive signed-16 weights.
+    if (weight == 0 || weight == 32768)
+      return hn::Min(weight == 0 ? av : bv, hn::Set(d, uint16_t(maximum_code)));
+    // XOR subtracts 32768 from each unsigned sample. Since the two weights sum
+    // to 32768, signed pairwise multiply-add followed by the same Q15 rounding
+    // produces the biased result without a difference/carry/sign dependency chain.
+    const auto as = hn::BitCast(di16, hn::Xor(av, pivot));
+    const auto bs = hn::BitCast(di16, hn::Xor(bv, pivot));
+    const auto round = hn::Set(di32, 16384);
+    const auto lo =
+        hn::ShiftRight<15>(hn::Add(hn::WidenMulPairwiseAdd(di32, hn::InterleaveLower(as, bs), weights), round));
+    const auto hi =
+        hn::ShiftRight<15>(hn::Add(hn::WidenMulPairwiseAdd(di32, hn::InterleaveUpper(di16, as, bs), weights), round));
+    // Interleave and reordered demotion have matching 128-bit block order on x86.
+    const auto value = hn::Xor(hn::BitCast(d, hn::ReorderDemote2To(di16, lo, hi)), pivot);
     return hn::Min(value, hn::Set(d, uint16_t(maximum_code)));
   };
   const bool contiguous = a.step == 2 && b.step == 2 && output.step == 2;
@@ -234,8 +240,7 @@ int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
   if constexpr (std::is_same<T, uint8_t>::value && operation == CP_MIX && fractional_bits == 15)
     return MixU8Q15Rows(a, b, output, r, weight);
 #endif
-// SSE4 measured slower with the carry-based blend; retain its prior arithmetic.
-#if HWY_ARCH_X86 && HWY_TARGET != HWY_SSE4
+#if HWY_ARCH_X86
   if constexpr (std::is_same<T, uint16_t>::value && operation == CP_MIX && fractional_bits == 15)
     return MixU16Q15Rows(a, b, output, r, weight, maximum_code);
 #endif
