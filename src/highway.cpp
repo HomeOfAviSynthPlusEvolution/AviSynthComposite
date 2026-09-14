@@ -82,11 +82,11 @@ hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
 // Exact dyadic weights need no floating-point arithmetic. Convex blends sum
 // to at most 65535*32768+16384; Add/Subtract bounds are documented below.
 // The MIX dispatcher may also round continuous opacity to Q15 (<=1 LSB).
-#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES || HWY_ARCH_X86
 int MixU8Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight) {
   // a + round((b-a)*w/32768) is the same Q15 convex blend. Swap inputs
   // so w <= 16384 fits signed lanes; differences are in [-255, 255].
-  // SQRDMULH rounds ties upwards, including negative differences.
+  // MulFixedPoint15 rounds ties upwards, including negative differences.
   if (weight > 16384) {
     std::swap(a, b);
     weight = 32768 - weight;
@@ -122,7 +122,7 @@ int MixU8Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
 template <class T, int operation = CP_MIX, int fractional_bits = 15>
 int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
                  uint32_t maximum_code = std::numeric_limits<T>::max(), uint32_t offset = 0) {
-#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES
+#if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES || HWY_ARCH_X86
   if constexpr (std::is_same<T, uint8_t>::value && operation == CP_MIX && fractional_bits == 15)
     return MixU8Q15Rows(a, b, output, r, weight);
 #endif
