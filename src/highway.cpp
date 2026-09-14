@@ -119,12 +119,59 @@ int MixU8Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r,
 }
 #endif
 
+#if HWY_ARCH_X86
+int MixU16Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
+                  uint32_t maximum_code) {
+  if (weight > 16384) {
+    std::swap(a, b);
+    weight = 32768 - weight;
+  }
+  const hn::ScalableTag<uint16_t> d;
+  const size_t n = hn::Lanes(d), width = size_t(r.width);
+  const auto blend = [&](auto av, auto bv) HWY_ATTR {
+    const auto up = hn::Ge(bv, av);
+    const auto diff = hn::Sub(hn::Max(av, bv), hn::Min(av, bv));
+    const auto w = hn::Set(d, uint16_t(weight));
+    const auto low = hn::Mul(diff, w), high = hn::MulHigh(diff, w);
+    // Negative differences round ties toward +infinity, hence 16383.
+    const auto rounded = hn::Add(low, hn::IfThenElse(up, hn::Set(d, uint16_t(16384)), hn::Set(d, uint16_t(16383))));
+    // A carry across bit 16 contributes two after division by 2^15.
+    const auto carry = hn::IfThenElse(hn::Lt(rounded, low), hn::Set(d, uint16_t(2)), hn::Zero(d));
+    const auto delta = hn::Add(hn::Add(hn::ShiftLeft<1>(high), carry), hn::ShiftRight<15>(rounded));
+    const auto value = hn::IfThenElse(up, hn::Add(av, delta), hn::Sub(av, delta));
+    return hn::Min(value, hn::Set(d, uint16_t(maximum_code)));
+  };
+  const bool contiguous = a.step == 2 && b.step == 2 && output.step == 2;
+  for (int y = r.first; y < r.first + r.count; ++y) {
+    size_t x = 0;
+    if (contiguous) {
+      const auto* ap = reinterpret_cast<const uint16_t*>(address(a, 0, y));
+      const auto* bp = reinterpret_cast<const uint16_t*>(address(b, 0, y));
+      auto* dst = reinterpret_cast<uint16_t*>(address(output, 0, y));
+      for (; x + n <= width; x += n)
+        hn::StoreU(blend(hn::LoadU(d, ap + x), hn::LoadU(d, bp + x)), d, dst + x);
+    }
+    for (; x < width; x += n) {
+      const size_t count = std::min(n, width - x);
+      StoreChannel(blend(LoadChannel(d, a, int(x), y, count), LoadChannel(d, b, int(x), y, count)), d, output, int(x),
+                   y, count);
+    }
+  }
+  return CP_OK;
+}
+#endif
+
 template <class T, int operation = CP_MIX, int fractional_bits = 15>
 int WeightedRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight,
                  uint32_t maximum_code = std::numeric_limits<T>::max(), uint32_t offset = 0) {
 #if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES || HWY_ARCH_X86
   if constexpr (std::is_same<T, uint8_t>::value && operation == CP_MIX && fractional_bits == 15)
     return MixU8Q15Rows(a, b, output, r, weight);
+#endif
+// SSE4 measured slower with the carry-based blend; retain its prior arithmetic.
+#if HWY_ARCH_X86 && HWY_TARGET != HWY_SSE4
+  if constexpr (std::is_same<T, uint16_t>::value && operation == CP_MIX && fractional_bits == 15)
+    return MixU16Q15Rows(a, b, output, r, weight, maximum_code);
 #endif
   const hn::ScalableTag<uint32_t> d;
   const hn::Rebind<T, decltype(d)> dt;

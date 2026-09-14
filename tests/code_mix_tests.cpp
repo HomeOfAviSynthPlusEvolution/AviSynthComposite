@@ -151,7 +151,36 @@ void VerifyNarrowContinuous() {
   }
 }
 
+void VerifyU16Q15Differences() {
+  constexpr int n = 65536;
+  std::vector<uint16_t> a(n), b(n), out(n), expected(n);
+  std::vector<int64_t> targets{CP_TARGET_C};
+  for (auto remaining = cp_supported_targets(); remaining; remaining &= remaining - 1)
+    targets.push_back(remaining & -remaining);
+  for (bool negative : {false, true}) {
+    for (int i = 0; i < n; ++i) {
+      a[i] = negative ? 65535 : 0;
+      b[i] = uint16_t(negative ? 65535 - i : i);
+    }
+    for (int weight : {0, 1, 127, 128, 8191, 8192, 16383, 16384, 16385, 20480, 20481, 32767, 32768}) {
+      const cp_plane_config c{{CP_U16, 16}, CP_MIX, weight / 32768.0, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+      for (int i = 0; i < n; ++i)
+        expected[i] = uint16_t((uint64_t(a[i]) * (32768 - weight) + uint64_t(b[i]) * weight + 16384) / 32768);
+      for (auto target : targets) {
+        if (cp_get_kernels(target)->process_plane(&c, {a.data(), n * 2, 2}, {b.data(), n * 2, 2}, nullptr, nullptr,
+                                                  nullptr, {out.data(), n * 2, 2}, {n, 1, 0, 1}) != CP_OK ||
+            out != expected) {
+          std::fprintf(stderr, "U16 Q15 mismatch: weight=%d negative=%d target=%lld\n", weight, negative,
+                       static_cast<long long>(target));
+          std::abort();
+        }
+      }
+    }
+  }
+}
+
 int main() {
+  VerifyU16Q15Differences();
   VerifyNarrowContinuous();
   VerifyQ15Differences();
   // All 256^3 base/source/mask combinations for both 8-bit operations.
