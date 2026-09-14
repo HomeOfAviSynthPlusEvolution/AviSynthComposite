@@ -42,8 +42,46 @@ void StoreChannel(hn::VFromD<D> v, D d, cp_plane p, int x, int y, size_t count) 
   for (size_t i = 0; i < count; ++i)
     std::memcpy(address(p, x + static_cast<int>(i), y), values + i, sizeof(T));
 }
+#if HWY_ARCH_X86 && HWY_TARGET <= HWY_AVX3
+// AVX512BW byte masks suppress accesses to the neighboring stepped channel,
+// including the byte immediately beyond the final declared sample.
+template <bool average>
+int SteppedU8Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight = 0) {
+  if constexpr (!average) {
+    if (weight > 16384) {
+      std::swap(a, b);
+      weight = 32768 - weight;
+    }
+  }
+  const hn::ScalableTag<uint8_t> d;
+  const hn::ScalableTag<int16_t> di;
+  const size_t n = hn::Lanes(di), width = size_t(r.width);
+  const auto even = hn::Eq(hn::And(hn::Iota(d, 0), hn::Set(d, uint8_t(1))), hn::Zero(d));
+  for (int y = r.first; y < r.first + r.count; ++y)
+    for (size_t x = 0; x < width; x += n) {
+      const auto active = hn::And(even, hn::FirstN(d, 2 * std::min(n, width - x)));
+      const auto av = hn::MaskedLoad(active, d, address(a, int(x), y));
+      const auto bv = hn::MaskedLoad(active, d, address(b, int(x), y));
+      auto value = av;
+      if constexpr (average)
+        value = hn::AverageRound(av, bv);
+      else {
+        const auto base = hn::BitCast(di, av), diff = hn::Sub(hn::BitCast(di, bv), base);
+        value = hn::BitCast(d, hn::Add(base, hn::MulFixedPoint15(diff, hn::Set(di, int16_t(weight)))));
+      }
+      hn::BlendedStore(value, active, d, address(output, int(x), y));
+    }
+  return CP_OK;
+}
+#endif
+
 template <class T>
 int AverageRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r) {
+#if HWY_ARCH_X86 && HWY_TARGET <= HWY_AVX3
+  if constexpr (std::is_same<T, uint8_t>::value)
+    if (a.step == 2 && b.step == 2 && output.step == 2)
+      return SteppedU8Rows<true>(a, b, output, r);
+#endif
   const hn::ScalableTag<T> d;
   const size_t n = hn::Lanes(d), width = static_cast<size_t>(r.width);
   const bool contiguous = a.step == sizeof(T) && b.step == sizeof(T) && output.step == sizeof(T);
@@ -84,6 +122,10 @@ hn::VFromD<D> DivideCode(D d, hn::VFromD<D> v, int bits) {
 // The MIX dispatcher may also round continuous opacity to Q15 (<=1 LSB).
 #if HWY_TARGET == HWY_NEON || HWY_TARGET == HWY_NEON_BF16 || HWY_TARGET == HWY_NEON_WITHOUT_AES || HWY_ARCH_X86
 int MixU8Q15Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r, uint32_t weight) {
+#if HWY_ARCH_X86 && HWY_TARGET <= HWY_AVX3
+  if (a.step == 2 && b.step == 2 && output.step == 2)
+    return SteppedU8Rows<false>(a, b, output, r, weight);
+#endif
   // a + round((b-a)*w/32768) is the same Q15 convex blend. Swap inputs
   // so w <= 16384 fits signed lanes; differences are in [-255, 255].
   // MulFixedPoint15 rounds ties upwards, including negative differences.

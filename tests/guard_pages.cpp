@@ -265,10 +265,37 @@ void large_masked_mix(const cp_kernels* k, int width) {
   }
 }
 
+void stepped_u8_mix(const cp_kernels* k, int width) {
+  const int span = 2 * width - 1;
+  Guarded a(span), b(span), out(span);
+  const cp_const_plane pa{a.data, span, 2}, pb{b.data, span, 2};
+  for (int weight : {1, 16383, 16384, 16385, 32767}) {
+    const cp_plane_config config{{CP_U8, 8}, CP_MIX, double(weight) / 32768, 0, 0, 0, 0, 0, CP_WEIGHT_CONTINUOUS};
+    for (unsigned char* destination : {out.data, a.data, b.data}) {
+      for (int x = 0; x < width; ++x) {
+        a.data[2 * x] = static_cast<unsigned char>(x * 29);
+        b.data[2 * x] = static_cast<unsigned char>(x * 37 + 81);
+      }
+      CHECK(k->process_plane(&config, pa, pb, nullptr, nullptr, nullptr, {destination, span, 2}, {width, 1, 0, 1}) ==
+            CP_OK);
+      for (int x = 0; x < width; ++x) {
+        const int av = static_cast<unsigned char>(x * 29), bv = static_cast<unsigned char>(x * 37 + 81);
+        const int expected = (av * (32768 - weight) + bv * weight + 16384) >> 15;
+        CHECK(destination[2 * x] == expected);
+        if (x + 1 < width)
+          CHECK(destination[2 * x + 1] == 0xCD);
+      }
+    }
+  }
+}
+
 int main() {
   std::vector<int64_t> targets = {0};
   for (int64_t rest = cp_supported_targets(); rest; rest &= rest - 1)
     targets.push_back(rest & -rest);
+  for (auto target : targets)
+    for (int width : {1, 31, 32, 33, 65})
+      stepped_u8_mix(cp_get_kernels(target), width);
   for (auto target : targets)
     for (int width : {65536, 65537, 65543})
       large_masked_mix(cp_get_kernels(target), width);
