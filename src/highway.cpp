@@ -75,8 +75,32 @@ int SteppedU8Rows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r
 }
 #endif
 
+// Isolate the contiguous loop from stepped-channel staging and descriptor reloads.
+HWY_NOINLINE int AverageU8Contiguous(const uint8_t* ap, const uint8_t* bp, uint8_t* dst, ptrdiff_t a_stride,
+                                     ptrdiff_t b_stride, ptrdiff_t dst_stride, int width, int count) {
+  const hn::ScalableTag<uint8_t> d;
+  const size_t n = hn::Lanes(d), end = size_t(width) - size_t(width) % n;
+  for (int y = 0; y < count; ++y) {
+    size_t x = 0;
+    for (; x < end; x += n)
+      hn::StoreU(hn::AverageRound(hn::LoadU(d, ap + x), hn::LoadU(d, bp + x)), d, dst + x);
+    for (; x < size_t(width); ++x)
+      dst[x] = uint8_t((unsigned(ap[x]) + bp[x] + 1) >> 1);
+    if (y + 1 < count) {
+      ap += a_stride;
+      bp += b_stride;
+      dst += dst_stride;
+    }
+  }
+  return CP_OK;
+}
+
 template <class T>
 int AverageRows(cp_const_plane a, cp_const_plane b, cp_plane output, cp_rows r) {
+  if constexpr (std::is_same<T, uint8_t>::value)
+    if (a.step == 1 && b.step == 1 && output.step == 1)
+      return AverageU8Contiguous(address(a, 0, r.first), address(b, 0, r.first), address(output, 0, r.first), a.stride,
+                                 b.stride, output.stride, r.width, r.count);
 #if HWY_ARCH_X86 && HWY_TARGET <= HWY_AVX3
   if constexpr (std::is_same<T, uint8_t>::value)
     if (a.step == 2 && b.step == 2 && output.step == 2)

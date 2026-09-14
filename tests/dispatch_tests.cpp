@@ -549,7 +549,37 @@ void CheckDenseCopy(const cp_kernels* table) {
       }
 }
 
-int main() {
+void U8AverageBounds(const cp_kernels* table) {
+  for (int width : {1, 63, 64, 65, 255, 256, 257, 511, 512, 513, 1920})
+    for (bool negative : {false, true})
+      for (int alias : {0, 1, 2}) {
+        const int height = 5, pitch = width + 13;
+        std::vector<uint8_t> a(pitch * height + 2), b(a.size()), out(a.size(), 0xAD);
+        for (size_t i = 0; i < a.size(); ++i) {
+          a[i] = uint8_t(i * 37);
+          b[i] = uint8_t(i * 19 + 3);
+        }
+        auto& dest = alias == 1 ? a : alias == 2 ? b : out;
+        auto expected = dest;
+        const int origin = 1 + (negative ? pitch * (height - 1) : 0);
+        const ptrdiff_t stride = negative ? -pitch : pitch;
+        for (int y = 1; y < 4; ++y)
+          for (int x = 0; x < width; ++x) {
+            const ptrdiff_t i = origin + y * stride + x;
+            expected[i] = uint8_t((unsigned(a[i]) + b[i] + 1) >> 1);
+          }
+        cp_plane_config config{};
+        config.format = {CP_U8, 8};
+        config.operation = CP_MIX;
+        config.opacity = .5;
+        CHECK(table->process_plane(&config, {a.data() + origin, stride, 1}, {b.data() + origin, stride, 1}, nullptr,
+                                   nullptr, nullptr, {dest.data() + origin, stride, 1},
+                                   {width, height, 1, 3}) == CP_OK);
+        CHECK(dest == expected);
+      }
+}
+
+int main(int argc, char** argv) {
   CHECK(cp_get_kernels(CP_TARGET_C));
   CHECK(cp_get_kernels(CP_TARGET_NATIVE));
   CHECK(cp_choose_target(0) == CP_TARGET_C);
@@ -564,7 +594,14 @@ int main() {
   std::vector<int64_t> targets = {CP_TARGET_C};
   for (int64_t remaining = supported; remaining; remaining &= remaining - 1)
     targets.push_back(remaining & -remaining);
+  if (argc > 1 && std::strcmp(argv[1], "u8-average") == 0) {
+    for (const int64_t target : targets)
+      U8AverageBounds(cp_get_kernels(target));
+    std::puts("U8 average boundaries passed");
+    return 0;
+  }
   for (const int64_t target : targets) {
+    U8AverageBounds(cp_get_kernels(target));
     CheckDenseCopy(cp_get_kernels(target));
     const auto* table = cp_get_kernels(target);
     CHECK(table);
