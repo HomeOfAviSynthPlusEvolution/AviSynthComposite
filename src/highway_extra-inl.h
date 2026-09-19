@@ -345,7 +345,9 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
         const auto ay = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[0] + x)));
         const auto au = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[1] + x)));
         const auto av = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, rows[2] + x)));
-        const auto factor_for = [&](int p) HWY_ATTR {
+        // v141 misses implicit captures in discarded constexpr branches.
+        const auto factor_for = [&shared, &d, &di, &dt, &mask_rows, &x, &madd, &slope, &opacity,
+                                 &reciprocal, &one, &common_factor](int p) HWY_ATTR {
           if constexpr (masked) {
             if (!shared) {
               const auto mv = hn::ConvertTo(d, hn::PromoteTo(di, hn::LoadU(dt, mask_rows[p] + x)));
@@ -394,13 +396,16 @@ void MultiplyYuvFloatCandidate(const cp_yuv_config* c, cp_const_yuv base, cp_con
           if (hn::AllFalse(d, VectorChannel(uncertain_0, uncertain_1, uncertain_2, p)))
             continue;
           hn::StoreU(VectorChannel(result_0, result_1, result_2, p), di, corrected[p]);
-          const auto correct_half = [&](auto upper) HWY_ATTR {
-            const auto flags = decltype(upper)::value
+          const auto correct_half = [&dh, &uncertain_0, &uncertain_1, &uncertain_2, &p, &half_lanes,
+                                     &dd, &di32, &db, &rows, &x, &guide_row, &maximum, &opacity64,
+                                     &mask_rows, &max64, &reciprocal64, &corrected](auto upper) HWY_ATTR {
+            using Upper = decltype(upper);
+            const auto flags = Upper::value
                                    ? hn::UpperHalfOfMask(dh, VectorChannel(uncertain_0, uncertain_1, uncertain_2, p))
                                    : hn::LowerHalfOfMask(dh, VectorChannel(uncertain_0, uncertain_1, uncertain_2, p));
             if (hn::AllFalse(dh, flags))
               return;
-            const size_t offset = decltype(upper)::value ? half_lanes : 0;
+            const size_t offset = Upper::value ? half_lanes : 0;
             const auto av = hn::PromoteTo(dd, hn::PromoteTo(di32, hn::LoadU(db, rows[p] + x + offset)));
             const auto gv = hn::PromoteTo(dd, hn::PromoteTo(di32, hn::LoadU(db, guide_row + x + offset)));
             const auto neutral = hn::Set(dd, p ? (maximum + 1) / 2 : 0);
