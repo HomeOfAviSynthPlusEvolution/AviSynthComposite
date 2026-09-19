@@ -1446,6 +1446,14 @@ void BoxRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_rows 
   }
 }
 
+// Resolve sample promotion outside the lambda for MSVC v141.
+template <class T, class D>
+HWY_INLINE hn::VFromD<D> PromoteSample(D d, hn::VFromD<hn::Rebind<T, D>> value) {
+  if constexpr (std::is_same<T, float>::value)
+    return value;
+  else
+    return hn::PromoteTo(d, value);
+}
 template <class T>
 void SampleRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_rows r) {
   if constexpr (std::is_same<T, float>::value) {
@@ -1456,13 +1464,14 @@ void SampleRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_ro
       // The complete box is interior. Read only the selected samples; staging
       // four separate tap vectors costs more than the arithmetic on sparse views.
       const auto box = [&](auto vertical) HWY_ATTR {
+        using Vertical = decltype(vertical);
         const int width = r.width, first = r.first, end = r.first + r.count;
         const int origin_x = s->origin_x, origin_y = s->origin_y;
         const ptrdiff_t input_step = source.step, output_step = out.step;
         for (int y = first; y < end; ++y) {
-          const int sy = static_cast<int>(int64_t(origin_y) + int64_t(y) * decltype(vertical)::value);
+          const int sy = static_cast<int>(int64_t(origin_y) + int64_t(y) * Vertical::value);
           const auto* row0 = address(source, origin_x, sy);
-          const auto* row1 = decltype(vertical)::value == 2 ? address(source, origin_x, sy + 1) : row0;
+          const auto* row1 = Vertical::value == 2 ? address(source, origin_x, sy + 1) : row0;
           auto* destination = address(out, 0, y);
           for (int x = 0; x < width; ++x) {
             const ptrdiff_t offset = ptrdiff_t(x * 2) * input_step;
@@ -1470,7 +1479,7 @@ void SampleRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_ro
             std::memcpy(&a, row0 + offset, sizeof(a));
             std::memcpy(&b, row0 + offset + input_step, sizeof(b));
             float value = a + b;
-            if constexpr (decltype(vertical)::value == 2) {
+            if constexpr (Vertical::value == 2) {
               float c, e;
               std::memcpy(&c, row1 + offset, sizeof(c));
               std::memcpy(&e, row1 + offset + input_step, sizeof(e));
@@ -1505,10 +1514,7 @@ void SampleRows(cp_const_plane source, cp_plane out, const cp_sampling* s, cp_ro
       const size_t count = std::min(n, static_cast<size_t>(r.width) - xx);
       const auto tap = [&](int dx, int dy) HWY_ATTR {
         const auto v = SampleTap(dt, source, s, x, y, dx, dy, count);
-        if constexpr (std::is_same<T, float>::value)
-          return v;
-        else
-          return hn::PromoteTo(d, v);
+        return PromoteSample<T>(d, v);
       };
       auto value = tap(0, 0);
       int shift = 0;
