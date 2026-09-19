@@ -817,9 +817,11 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
       dst[p] = reinterpret_cast<T*>(address(out[p], 0, y));
     }
     const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
+      // Name the tag before nested lambdas for MSVC v141's dependent lookup.
+      using Direct = decltype(direct);
       const int x = static_cast<int>(xx);
       const auto load = [&](cp_const_plane plane, const T* ptr) HWY_ATTR {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           return hn::LoadU(dt, ptr + xx);
         else
           return LoadChannel(dt, plane, x, y, count);
@@ -863,7 +865,7 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
           channel(p);
       }
       for (int p = 0; p < 3; ++p) {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           hn::StoreU(VectorChannel(values_0, values_1, values_2, p), dt, dst[p] + xx);
         else
           StoreChannel(VectorChannel(values_0, values_1, values_2, p), dt, out[p], x, y, count);
@@ -963,15 +965,17 @@ void IntegerYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_y
   // YuvRows has established contiguous samples. Split only the bounded tail.
   for (int y = r.first; y < r.first + r.count; ++y) {
     const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
+      // Name the tag before nested lambdas for MSVC v141's dependent lookup.
+      using Direct = decltype(direct);
       const int x = static_cast<int>(xx);
       const auto load = [&](cp_const_plane p) HWY_ATTR {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           return hn::LoadU(dt, reinterpret_cast<const T*>(address(p, 0, y)) + xx);
         else
           return LoadChannel(dt, p, x, y, count);
       };
       const auto store = [&](auto value, cp_plane p) HWY_ATTR {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           hn::StoreU(value, dt, reinterpret_cast<T*>(address(p, 0, y)) + xx);
         else
           StoreChannel(value, dt, p, x, y, count);
@@ -1036,15 +1040,17 @@ void IntegerYuvArtistic(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv 
   // YuvRows has established contiguous samples. Split only the bounded tail.
   for (int y = r.first; y < r.first + r.count; ++y) {
     const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
+      // Name the tag before nested lambdas for MSVC v141's dependent lookup.
+      using Direct = decltype(direct);
       const int x = static_cast<int>(xx);
       const auto load = [&](cp_const_plane p) HWY_ATTR {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           return hn::LoadU(dt, reinterpret_cast<const T*>(address(p, 0, y)) + xx);
         else
           return LoadChannel(dt, p, x, y, count);
       };
       const auto store = [&](auto value, cp_plane p) HWY_ATTR {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           hn::StoreU(value, dt, reinterpret_cast<T*>(address(p, 0, y)) + xx);
         else
           StoreChannel(value, dt, p, x, y, count);
@@ -1146,11 +1152,13 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       dst[p] = reinterpret_cast<float*>(address(out[p], 0, y));
     }
     const auto block = [&](auto direct, size_t xx, size_t count) HWY_ATTR {
+      // Name the tag before nested lambdas for MSVC v141's dependent lookup.
+      using Direct = decltype(direct);
       const auto zero = hn::Zero(d), one = hn::Set(d, 1);
       const auto over = hn::Set(d, 32.0 / 255), upper_limit = hn::Set(d, 1 + 32.0 / 255);
       const int x = static_cast<int>(xx);
       const auto load = [&](cp_const_plane plane, const float* ptr) HWY_ATTR {
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           return hn::LoadU(dt, ptr + xx);
         else
           return LoadChannel(dt, plane, x, y, count);
@@ -1194,7 +1202,7 @@ void FloatYuvAddSubtract(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv
       // including original endpoint bits needed for exact in-place execution.
       const auto store = [&](auto original, auto value, auto unchanged, int p) HWY_ATTR {
         const auto result = hn::IfThenElse(NarrowMask(dt, d, unchanged), original, hn::DemoteTo(dt, value));
-        if constexpr (decltype(direct)::value)
+        if constexpr (Direct::value)
           hn::StoreU(result, dt, dst[p] + xx);
         else
           StoreChannel(result, dt, out[p], x, y, count);
