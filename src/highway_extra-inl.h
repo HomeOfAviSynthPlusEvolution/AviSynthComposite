@@ -9,6 +9,19 @@ HWY_INLINE V& VectorChannel(V& y, V& u, V& v, int channel) {
   return channel == 0 ? y : channel == 1 ? u : v;
 }
 
+// MSVC v141 does not reliably discard type-dependent branches in nested lambdas.
+// Keep the float/integer conversion in an ordinary function template.
+template <class T, class D>
+HWY_INLINE hn::VFromD<hn::Rebind<T, D>> DemoteYuvSample(D d, hn::VFromD<D> value, hn::VFromD<D> max) {
+  const hn::Rebind<T, D> dt;
+  if constexpr (std::is_same<T, float>::value)
+    return hn::DemoteTo(dt, value);
+  else {
+    const hn::Rebind<int32_t, D> di;
+    value = hn::Min(max, hn::Max(hn::Zero(d), value));
+    return hn::DemoteTo(dt, hn::DemoteInRangeTo(di, hn::Add(value, hn::Set(d, .5))));
+  }
+}
 template <class T, class D>
 void StoreDouble(hn::VFromD<D> value, D d, cp_format f, cp_plane out, int x, int y, size_t count) {
   const hn::Rebind<float, D> df;
@@ -706,7 +719,7 @@ HWY_NOINLINE void YuvStepped(const cp_yuv_config* c, cp_const_yuv base, cp_const
   if constexpr (std::is_same<T, uint8_t>::value && !masked && multiply) {
     const double level = c->opacity * 256;
     if (int64_t(r.width) * r.count >= 65536 && level > 0 && level < 256 && level == std::floor(level)) {
-      const U8MultiplyCorrections prepared{unsigned(level)};
+      const U8MultiplyCorrections prepared{static_cast<unsigned>(level)};
       YuvSteppedPrepared<T, masked, multiply>(c, base, source, masks, output, r, &prepared);
       return;
     }
@@ -779,7 +792,7 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
       if constexpr (!masked) {
         const double level = c->opacity * 256;
         if (level > 0 && level < 256 && level == std::floor(level)) {
-          MultiplyYuvU16Dyadic(c, base, source, output, r, unsigned(level));
+          MultiplyYuvU16Dyadic(c, base, source, output, r, static_cast<unsigned>(level));
           return;
         }
       }
@@ -796,7 +809,7 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
       if constexpr (!masked) {
         const double level = c->opacity * 256;
         if (int64_t(r.width) * r.count >= 65536 && level > 0 && level < 256 && level == std::floor(level)) {
-          MultiplyYuvU8Dyadic(c, base, source, output, r, unsigned(level));
+          MultiplyYuvU8Dyadic(c, base, source, output, r, static_cast<unsigned>(level));
           return;
         }
       }
@@ -845,13 +858,7 @@ void MultiplyYuvRows(const cp_yuv_config* c, cp_const_yuv base, cp_const_yuv sou
         if constexpr (interior)
           // Only this specialization has 0 < opacity < 1 and no mask.
           result = hn::Add(av, hn::Mul(hn::Sub(target, av), opacity));
-        if constexpr (std::is_same<T, float>::value)
-          VectorChannel(values_0, values_1, values_2, p) = hn::DemoteTo(dt, result);
-        else {
-          result = hn::Min(max, hn::Max(zero, result));
-          VectorChannel(values_0, values_1, values_2, p) =
-              hn::DemoteTo(dt, hn::DemoteInRangeTo(di, hn::Add(result, hn::Set(d, .5))));
-        }
+        VectorChannel(values_0, values_1, values_2, p) = DemoteYuvSample<T>(d, result, max);
         if constexpr (!interior)
           VectorChannel(values_0, values_1, values_2, p) = hn::IfThenElse(NarrowMask(dt, d, hn::Eq(w, zero)), original,
                                                                         VectorChannel(values_0, values_1, values_2, p));
